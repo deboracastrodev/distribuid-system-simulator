@@ -1,0 +1,6 @@
+_bmad/
+.agents/
+.claude/
+.gemini/
+.venv/
+steps.md
