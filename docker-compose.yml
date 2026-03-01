@@ -72,6 +72,21 @@ services:
       timeout: 3s
       retries: 5
 
+  # --- AGENTE PLANNER (Python + LangGraph) ---
+  agent:
+    build: ./agent
+    container_name: nexus-agent
+    depends_on:
+      kafka:
+        condition: service_healthy
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+      KAFKA_TOPIC: orders
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://jaeger:4317
+      OTEL_SERVICE_NAME: nexus-agent
+    profiles:
+      - agent
+
   # --- OBSERVABILIDADE (Opcional, mas recomendado para o futuro) ---
   jaeger:
     image: jaegertracing/all-in-one:latest
