@@ -8,14 +8,15 @@ services:
     environment:
       - KAFKA_CFG_NODE_ID=1
       - KAFKA_CFG_PROCESS_ROLES=controller,broker
-      - KAFKA_CFG_LISTENERS=PLAINTEXT://:9092,CONTROLLER://:9093
-      - KAFKA_CFG_LISTENER_SECURITY_PROTOCOL_MAP=CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT
+      - KAFKA_CFG_LISTENERS=INTERNAL://:29092,EXTERNAL://:9092,CONTROLLER://:9093
+      - KAFKA_CFG_LISTENER_SECURITY_PROTOCOL_MAP=CONTROLLER:PLAINTEXT,INTERNAL:PLAINTEXT,EXTERNAL:PLAINTEXT
       - KAFKA_CFG_CONTROLLER_QUORUM_VOTERS=1@kafka:9093
       - KAFKA_CFG_CONTROLLER_LISTENER_NAMES=CONTROLLER
-      - KAFKA_CFG_ADVERTISED_LISTENERS=PLAINTEXT://localhost:9092
+      - KAFKA_CFG_ADVERTISED_LISTENERS=INTERNAL://kafka:29092,EXTERNAL://localhost:9092
+      - KAFKA_CFG_INTER_BROKER_LISTENER_NAME=INTERNAL
       - KAFKA_CFG_AUTO_CREATE_TOPICS_ENABLE=true
     healthcheck:
-      test: ["CMD", "kafka-topics.sh", "--bootstrap-server", "localhost:9092", "--list"]
+      test: ["CMD", "kafka-topics.sh", "--bootstrap-server", "localhost:29092", "--list"]
       interval: 10s
       timeout: 10s
       retries: 5
@@ -29,7 +30,7 @@ services:
     environment:
       - REDIS_PASSWORD=nexus_pass
     healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
+      test: ["CMD-SHELL", "REDISCLI_AUTH=$$REDIS_PASSWORD redis-cli ping"]
       interval: 5s
       timeout: 3s
       retries: 5
@@ -48,6 +49,20 @@ services:
       - ./init.sql:/docker-entrypoint-initdb.d/init.sql
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U nexus_user -d nexus_db"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  # --- COORDENAÇÃO (Service Discovery & Health Checks) ---
+  consul:
+    image: hashicorp/consul:1.22
+    container_name: nexus-consul
+    command: consul agent -dev -client=0.0.0.0
+    ports:
+      - "8500:8500"
+      - "8600:8600/udp"
+    healthcheck:
+      test: ["CMD", "consul", "members"]
       interval: 5s
       timeout: 3s
       retries: 5

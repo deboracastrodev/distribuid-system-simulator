@@ -4,3 +4,5 @@ _bmad/
 .gemini/
 .venv/
 steps.md
+_bmad-output/
+.github/
