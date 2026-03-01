@@ -63,7 +63,7 @@ check "Redis (ping com auth)" \
   docker compose exec -T redis redis-cli -a nexus_pass ping
 
 check "Kafka (listar tópicos)" \
-  docker compose exec -T kafka kafka-topics.sh --bootstrap-server localhost:9092 --list
+  docker compose exec -T kafka /opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:29092 --list
 
 check "Consul (members)" \
   docker compose exec -T consul consul members
@@ -76,24 +76,25 @@ PHASE1_FAIL=$FAIL
 
 # ─── Fase 2: Inter-container ────────────────────────────────────────────────
 echo ""
-echo -e "${BOLD}Fase 2: Validação inter-container (via Consul)${NC}"
+echo -e "${BOLD}Fase 2: Validação inter-container (via Postgres)${NC}"
 echo ""
 
 # Resetar contadores para fase 2
+# Usa o container postgres (Debian + bash) que suporta /dev/tcp
 PASS=0
 FAIL=0
 
-check "Consul → Redis (porta 6379)" \
-  docker compose exec -T consul sh -c "echo > /dev/tcp/redis/6379"
+check "Postgres → Redis (porta 6379)" \
+  docker compose exec -T postgres bash -c "echo > /dev/tcp/redis/6379"
 
-check "Consul → Postgres (porta 5432)" \
-  docker compose exec -T consul sh -c "echo > /dev/tcp/postgres/5432"
+check "Postgres → Consul (porta 8500)" \
+  docker compose exec -T postgres bash -c "echo > /dev/tcp/consul/8500"
 
-check "Consul → Kafka (porta 29092 INTERNAL)" \
-  docker compose exec -T consul sh -c "echo > /dev/tcp/kafka/29092"
+check "Postgres → Kafka (porta 29092 INTERNAL)" \
+  docker compose exec -T postgres bash -c "echo > /dev/tcp/kafka/29092"
 
-check "Consul → Jaeger (porta 16686)" \
-  docker compose exec -T consul sh -c "echo > /dev/tcp/jaeger/16686"
+check "Postgres → Jaeger (porta 16686)" \
+  docker compose exec -T postgres bash -c "echo > /dev/tcp/jaeger/16686"
 
 PHASE2_PASS=$PASS
 PHASE2_FAIL=$FAIL
