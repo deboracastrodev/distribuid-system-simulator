@@ -1,0 +1,21 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "order-completed.schema.json",
+  "title": "OrderCompleted Event",
+  "description": "Schema do campo data para o evento OrderCompleted (seq_id: 5)",
+  "type": "object",
+  "properties": {
+    "final_status": {
+      "type": "string",
+      "enum": ["delivered", "cancelled"],
+      "description": "Status final do pedido"
+    },
+    "completed_at": {
+      "type": "string",
+      "format": "date-time",
+      "description": "Timestamp de conclusao do pedido em ISO 8601 UTC"
+    }
+  },
+  "required": ["final_status", "completed_at"],
+  "additionalProperties": false
+}

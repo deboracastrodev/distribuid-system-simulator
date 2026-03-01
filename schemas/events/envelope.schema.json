@@ -1,0 +1,72 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "envelope.schema.json",
+  "title": "Nexus Event Envelope",
+  "description": "Envelope padrao para todos os eventos do Nexus Event Gateway",
+  "type": "object",
+  "properties": {
+    "event_id": {
+      "type": "string",
+      "format": "uuid",
+      "description": "ID unico do evento (UUID v4)"
+    },
+    "event_type": {
+      "type": "string",
+      "enum": [
+        "OrderCreated",
+        "InventoryValidated",
+        "PaymentProcessed",
+        "OrderShipped",
+        "OrderCompleted",
+        "ABORT_PLAN"
+      ],
+      "description": "Tipo do evento"
+    },
+    "plan_id": {
+      "type": "string",
+      "pattern": "^plan_[a-zA-Z0-9_-]+$",
+      "description": "ID do plano de execucao gerado pelo Agent"
+    },
+    "seq_id": {
+      "type": "integer",
+      "minimum": 1,
+      "description": "Numero sequencial do evento dentro do plano (ausente em ABORT_PLAN)"
+    },
+    "order_id": {
+      "type": "string",
+      "format": "uuid",
+      "description": "ID do pedido (usado como Kafka key para ordering)"
+    },
+    "timestamp": {
+      "type": "string",
+      "format": "date-time",
+      "description": "Timestamp de criacao do evento em ISO 8601 UTC"
+    },
+    "data": {
+      "type": "object",
+      "description": "Payload especifico do tipo de evento"
+    }
+  },
+  "required": [
+    "event_id",
+    "event_type",
+    "plan_id",
+    "order_id",
+    "timestamp",
+    "data"
+  ],
+  "if": {
+    "not": {
+      "properties": {
+        "event_type": {
+          "const": "ABORT_PLAN"
+        }
+      }
+    }
+  },
+  "then": {
+    "required": [
+      "seq_id"
+    ]
+  }
+}

@@ -1,0 +1,24 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "order-shipped.schema.json",
+  "title": "OrderShipped Event",
+  "description": "Schema do campo data para o evento OrderShipped (seq_id: 4)",
+  "type": "object",
+  "properties": {
+    "tracking_code": {
+      "type": "string",
+      "description": "Codigo de rastreamento da transportadora"
+    },
+    "carrier": {
+      "type": "string",
+      "description": "Nome da transportadora"
+    },
+    "estimated_delivery": {
+      "type": "string",
+      "format": "date",
+      "description": "Data estimada de entrega (formato ISO 8601 date)"
+    }
+  },
+  "required": ["tracking_code", "carrier", "estimated_delivery"],
+  "additionalProperties": false
+}

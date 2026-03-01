@@ -1,0 +1,40 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "inventory-validated.schema.json",
+  "title": "InventoryValidated Event",
+  "description": "Schema do campo data para o evento InventoryValidated (seq_id: 2)",
+  "type": "object",
+  "properties": {
+    "validated": {
+      "type": "boolean",
+      "description": "Se o inventario foi validado com sucesso"
+    },
+    "items_status": {
+      "type": "array",
+      "minItems": 1,
+      "description": "Status de cada item no inventario",
+      "items": {
+        "type": "object",
+        "properties": {
+          "product_id": {
+            "type": "string",
+            "description": "ID do produto"
+          },
+          "available": {
+            "type": "boolean",
+            "description": "Se o produto esta disponivel em estoque"
+          },
+          "reserved_quantity": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "Quantidade reservada no estoque"
+          }
+        },
+        "required": ["product_id", "available", "reserved_quantity"],
+        "additionalProperties": false
+      }
+    }
+  },
+  "required": ["validated", "items_status"],
+  "additionalProperties": false
+}

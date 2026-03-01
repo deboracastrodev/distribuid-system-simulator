@@ -10,8 +10,8 @@ Decisoes tecnologicas baseadas nos ADRs registrados em `docs/blueprint-arquitetu
 - [x] **Task 1.1:** Criar `docker-compose.yml` com Kafka (KRaft), Redis Cluster e Postgres.
 - [x] **Task 1.2:** Adicionar Consul ao `docker-compose.yml` para Service Discovery e Health Checks (ADR-002).
 - [x] **Task 1.3:** Validar conectividade entre todos os containers (Kafka, Redis, Postgres, Consul).
-- [ ] **Task 1.4:** Definir JSON Schema para os eventos (`OrderCreated`, `InventoryValidated`, `ABORT_PLAN`, etc).
-- [ ] **Task 1.5:** Criar Script SQL de inicializacao (Postgres) com tabela de Pedidos e Outbox.
+- [x] **Task 1.4:** Definir JSON Schema para os eventos (`OrderCreated`, `InventoryValidated`, `ABORT_PLAN`, etc).
+- [x] **Task 1.5:** Criar Script SQL de inicializacao (Postgres) com tabela de Pedidos e Outbox.
 
 ## 🔵 Fase 2: O Cerebro Agentico (Python)
 

@@ -1,0 +1,25 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "abort-plan.schema.json",
+  "title": "ABORT_PLAN Event",
+  "description": "Schema do campo data para o evento ABORT_PLAN (Tombstone — sem seq_id)",
+  "type": "object",
+  "properties": {
+    "reason": {
+      "type": "string",
+      "description": "Motivo do abort do plano"
+    },
+    "abort_code": {
+      "type": "string",
+      "enum": ["inventory_failed", "payment_rejected", "timeout", "manual"],
+      "description": "Codigo padronizado do motivo do abort"
+    },
+    "aborted_at_seq": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Ultimo seq_id processado antes do abort (opcional)"
+    }
+  },
+  "required": ["reason", "abort_code"],
+  "additionalProperties": false
+}

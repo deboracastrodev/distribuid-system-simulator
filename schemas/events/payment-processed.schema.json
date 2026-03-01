@@ -1,0 +1,36 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "payment-processed.schema.json",
+  "title": "PaymentProcessed Event",
+  "description": "Schema do campo data para o evento PaymentProcessed (seq_id: 3)",
+  "type": "object",
+  "properties": {
+    "payment_id": {
+      "type": "string",
+      "format": "uuid",
+      "description": "ID unico do pagamento (UUID v4)"
+    },
+    "method": {
+      "type": "string",
+      "enum": ["credit_card", "debit_card", "pix", "boleto"],
+      "description": "Metodo de pagamento utilizado"
+    },
+    "status": {
+      "type": "string",
+      "enum": ["approved", "rejected"],
+      "description": "Status do processamento do pagamento"
+    },
+    "amount": {
+      "type": "number",
+      "minimum": 0,
+      "description": "Valor cobrado"
+    },
+    "currency": {
+      "type": "string",
+      "default": "BRL",
+      "description": "Moeda do pagamento (default: BRL)"
+    }
+  },
+  "required": ["payment_id", "method", "status", "amount", "currency"],
+  "additionalProperties": false
+}
