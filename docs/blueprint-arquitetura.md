@@ -27,7 +27,7 @@ Este documento descreve a transposição do simulador para uma arquitetura de pr
 | **Mensageria** | **Apache Kafka** | Transporte persistente com ordenação por chave (`order_id`). |
 | **Estado Atômico** | **Redis Cluster** | Controle de sequência via **Scripts Lua** para evitar Race Conditions. |
 | **Source of Truth** | **PostgreSQL** | Persistência ACID e implementação do **Transaction Outbox Pattern**. |
-| **Coordenação** | **Etcd** | Service Discovery e configurações de Circuit Breaker. |
+| **Coordenação** | **Consul** | Service Discovery, Health Checks e configurações de Circuit Breaker. |
 
 ---
 
@@ -87,6 +87,39 @@ sequenceDiagram
 2.  [ ] **Go Core:** Implementar o Consumer com suporte a Lua Scripts e Outbox.
 3.  [ ] **Python Agent:** Implementar o Planner usando LangGraph e injeção de headers Kafka.
 4.  [ ] **Dashboard:** Configurar stack de monitoramento (Prometheus/Grafana).
+
+---
+
+## 6. Registro de Decisoes Arquiteturais (ADR)
+
+### ADR-001: Go Client Kafka — franz-go ao inves de confluent-kafka-go/sarama
+
+- **Data:** 2026-02-28
+- **Contexto:** O blueprint original listava `confluent-kafka-go` ou `sarama` como opcoes para o consumer Kafka em Go.
+- **Decisao:** Adotar **franz-go** como client Kafka.
+- **Razao:** franz-go e puro Go (sem dependencia de librdkafka em C), 4x mais rapido no producing e ate 10-20x no consuming comparado a confluent-kafka-go. Sarama esta abandonado. franz-go tem suporte completo a transacoes, regex topic consuming e metricas Prometheus via plugins.
+- **Trade-off:** Menor base de usuarios que confluent-kafka-go, porem comunidade ativa e feature-complete.
+
+### ADR-002: Consul ao inves de Etcd para coordenacao
+
+- **Data:** 2026-02-28
+- **Contexto:** O blueprint original definia Etcd para Service Discovery e Circuit Breaker. O projeto roda em Docker Compose, sem Kubernetes no escopo atual.
+- **Decisao:** Substituir **Etcd** por **Consul**.
+- **Razao:** Em ambiente Docker Compose, Etcd nao oferece vantagens — ele brilha como backend nativo do Kubernetes (onde ja vem embutido e "de graca"). Consul oferece: health checks nativos (essencial para Circuit Breaker), service discovery via DNS, Web UI para debugging, e service mesh (Consul Connect) caso o projeto escale. Ambos usam Raft para consenso e garantem consistencia forte (CP).
+- **Trade-off:** Se o projeto migrar para Kubernetes no futuro, Etcd ja estaria disponivel sem custo adicional. Consul precisaria rodar como servico separado dentro do cluster K8s. A decisao prioriza o cenario atual (Docker Compose) sobre um cenario futuro hipotetico.
+
+### ADR-003: Validacao das demais stacks — mantidas conforme blueprint original
+
+- **Data:** 2026-02-28
+- **Contexto:** Pesquisa tecnica comparativa realizada para todas as camadas da arquitetura.
+- **Decisao:** Manter **Go**, **LangGraph**, **Kafka**, **Redis + Lua** e **PostgreSQL** conforme definidos originalmente.
+- **Razao por camada:**
+  - **Go:** Melhor equilibrio performance/produtividade para workloads I/O-bound (Kafka consumer). Rust teria ~30% mais performance e 2-4x menos memoria, mas complexidade de desenvolvimento nao se justifica. Java tem overhead de memoria e latencia de startup.
+  - **LangGraph:** Grafo de estados e o modelo correto para gerar sequencias deterministicas de eventos com `plan_id`/`seq_id`. CrewAI (role-based) e AutoGen (conversacional) nao se adequam. Tendencia de mercado 2026 converge para modelos baseados em grafos.
+  - **Kafka:** Exactly-once semantics mais maduras do mercado. KRaft eliminou dependencia do ZooKeeper. NATS nao tem exactly-once nativo (desqualificado para RF03). Pulsar e alternativa valida mas adiciona complexidade operacional (BookKeeper). Redpanda e promissor mas tem caveats de performance em producao prolongada.
+  - **Redis + Lua:** Unica opcao que combina atomicidade total, latencia sub-ms e +30% throughput vs comandos separados. Hash tags garantem co-localizacao de chaves por `order_id` no cluster.
+  - **PostgreSQL:** Unico RDBMS necessario para Transaction Outbox Pattern com ACID. Sem alternativas a considerar.
+- **Referencia:** Relatorio completo em `_bmad-output/planning-artifacts/research/technical-stack-validation-research-2026-02-28.md`
 
 ---
 *Nexus Event Gateway: Confiabilidade absoluta em um mundo caótico.*
