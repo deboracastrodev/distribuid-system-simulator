@@ -1,3 +1,10 @@
+networks:
+  nexus:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.28.0.0/16
+
 services:
   # --- MENSAGERIA (Exactly-Once Transport) ---
   kafka:
@@ -26,6 +33,8 @@ services:
       interval: 10s
       timeout: 10s
       retries: 5
+    networks:
+      - nexus
 
   # --- ESTADO ATÔMICO (Idempotency Engine) ---
   redis:
@@ -39,6 +48,8 @@ services:
       interval: 5s
       timeout: 3s
       retries: 5
+    networks:
+      - nexus
 
   # --- SOURCE OF TRUTH (ACID Storage) ---
   postgres:
@@ -57,20 +68,27 @@ services:
       interval: 5s
       timeout: 3s
       retries: 5
+    networks:
+      - nexus
 
   # --- COORDENAÇÃO (Service Discovery & Health Checks) ---
   consul:
     image: hashicorp/consul:1.22
     container_name: nexus-consul
-    command: consul agent -dev -client=0.0.0.0
+    command: consul agent -dev -client=0.0.0.0 -dns-port=53 -recursor=127.0.0.11 -config-file=/consul/config/services.json
     ports:
       - "8500:8500"
       - "8600:8600/udp"
+    volumes:
+      - ./consul-services.json:/consul/config/services.json
     healthcheck:
       test: ["CMD", "consul", "members"]
       interval: 5s
       timeout: 3s
       retries: 5
+    networks:
+      nexus:
+        ipv4_address: 172.28.0.100
 
   # --- SERVER GO (Event Processor / Exactly-Once Engine) ---
   server:
@@ -85,15 +103,19 @@ services:
         condition: service_healthy
       consul:
         condition: service_healthy
+    dns:
+      - 172.28.0.100
+    dns_search:
+      - service.consul
     environment:
-      KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+      KAFKA_BOOTSTRAP_SERVERS: kafka.service.consul:29092
       KAFKA_TOPIC: orders
       KAFKA_DLQ_TOPIC: orders-dlq
       KAFKA_CONSUMER_GROUP: nexus-server-group
-      REDIS_ADDR: redis:6379
+      REDIS_ADDR: redis.service.consul:6379
       REDIS_PASSWORD: nexus_pass
-      POSTGRES_DSN: postgres://nexus_user:nexus_pass@postgres:5432/nexus_db?sslmode=disable
-      CONSUL_ADDR: consul:8500
+      POSTGRES_DSN: postgres://nexus_user:nexus_pass@postgres.service.consul:5432/nexus_db?sslmode=disable
+      CONSUL_ADDR: consul.service.consul:8500
       OTEL_EXPORTER_OTLP_ENDPOINT: jaeger:4317
       OTEL_SERVICE_NAME: nexus-server
     ports:
@@ -103,6 +125,8 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
+    networks:
+      - nexus
 
   # --- AGENTE PLANNER (Python + LangGraph) ---
   agent:
@@ -111,13 +135,19 @@ services:
     depends_on:
       kafka:
         condition: service_healthy
+    dns:
+      - 172.28.0.100
+    dns_search:
+      - service.consul
     environment:
-      KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+      KAFKA_BOOTSTRAP_SERVERS: kafka.service.consul:29092
       KAFKA_TOPIC: orders
       OTEL_EXPORTER_OTLP_ENDPOINT: http://jaeger:4317
       OTEL_SERVICE_NAME: nexus-agent
     profiles:
       - agent
+    networks:
+      - nexus
 
   # --- OBSERVABILIDADE (Opcional, mas recomendado para o futuro) ---
   jaeger:
@@ -127,3 +157,5 @@ services:
       - "16686:16686" # UI
       - "4317:4317"  # OTLP gRPC
       - "4318:4318"  # OTLP HTTP
+    networks:
+      - nexus

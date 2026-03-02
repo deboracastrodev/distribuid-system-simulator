@@ -13,6 +13,7 @@ import (
 
 	consulapi "github.com/hashicorp/consul/api"
 
+	consulkv "github.com/user/nexus-server/internal/consul"
 	"github.com/user/nexus-server/internal/config"
 	"github.com/user/nexus-server/internal/consumer"
 	"github.com/user/nexus-server/internal/db"
@@ -73,8 +74,20 @@ func main() {
 		os.Exit(1)
 	}
 
-	// --- Outbox Dispatcher ---
-	disp := dispatcher.New(repo, cfg.WebhookURL, cfg.OutboxPollInterval, cfg.WebhookRetryMax, cfg.WebhookRetryDelay)
+	// --- Consul KV Watcher (Circuit Breaker config) ---
+	kvWatcher, err := consulkv.NewKVWatcher(cfg.ConsulAddr)
+	if err != nil {
+	        slog.Warn("Consul KV watcher init failed, using defaults", "error", err)
+	        // If it fails, we still need a watcher instance to avoid panics, 
+	        // but it might not be able to reload from Consul.
+	}
+
+	if kvWatcher != nil {
+	        kvWatcher.SeedDefaults()
+	}
+	// --- Outbox Dispatcher (with Circuit Breaker) ---
+	disp := dispatcher.New(repo, cfg.WebhookURL, cfg.OutboxPollInterval, cfg.WebhookRetryMax, cfg.WebhookRetryDelay, kvWatcher)
+
 	// --- Consul Registration ---
 	consulClient, serviceID, err := registerConsul(cfg)
 	if err != nil {
@@ -138,6 +151,13 @@ func main() {
 			}
 		}()
 	}
+
+	// Consul KV config watcher (hot-reload CB settings)
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		kvWatcher.Watch(ctx, 15*time.Second)
+	}()
 
 	slog.Info("nexus-server started", "topic", cfg.KafkaTopic, "group", cfg.KafkaConsumerGroup)
 

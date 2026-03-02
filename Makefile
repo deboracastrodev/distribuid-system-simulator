@@ -95,3 +95,17 @@ demo-full: up ## Sobe infra e executa agent para gerar fluxo completo
 db-check: ## Mostra estado atual dos pedidos no banco
 	@docker compose exec postgres psql -U nexus_user -d nexus_db -c "SELECT id, status, last_seq_processed, updated_at FROM orders ORDER BY updated_at DESC LIMIT 5;"
 	@docker compose exec postgres psql -U nexus_user -d nexus_db -c "SELECT id, event_type, processed, created_at FROM outbox ORDER BY created_at DESC LIMIT 5;"
+
+# --- Consul KV (Circuit Breaker Config) ---
+
+consul-kv-list: ## Lista todas as configs do Circuit Breaker no Consul KV
+	@curl -s http://localhost:8500/v1/kv/nexus/config/cb/?recurse | python3 -m json.tool 2>/dev/null || echo "No keys found"
+
+consul-kv-set: ## Altera config CB (ex: make consul-kv-set KEY=webhook_failure_threshold VAL=3)
+	@curl -s -X PUT -d '$(VAL)' http://localhost:8500/v1/kv/nexus/config/cb/$(KEY) && echo " OK: $(KEY)=$(VAL)"
+
+consul-kv-get: ## Lê config CB (ex: make consul-kv-get KEY=webhook_failure_threshold)
+	@curl -s http://localhost:8500/v1/kv/nexus/config/cb/$(KEY)?raw && echo ""
+
+consul-services: ## Lista serviços registrados no Consul
+	@curl -s http://localhost:8500/v1/agent/services | python3 -m json.tool
