@@ -22,14 +22,14 @@ Decisoes tecnologicas baseadas nos ADRs registrados em `docs/blueprint-arquitetu
 
 ## 🔴 Fase 3: O Coracao de Go
 
-- [ ] **Task 3.1:** Inicializar modulo Go e configurar consumidor Kafka com **franz-go** (ADR-001).
-- [ ] **Task 3.2:** Desenvolver Script Lua (`check_and_set_seq.lua`) no Redis para validacao de sequencia atomica, com testes isolados do script.
-- [ ] **Task 3.3:** Implementar logica de Waiting Room (buffer) no Redis para eventos fora de ordem, com TTL de 1h e encaminhamento para DLQ na expiracao.
-- [ ] **Task 3.4:** Implementar transacao ACID no Postgres (Update Order + Insert Outbox) em boundary transacional unico.
-- [ ] **Task 3.5:** Implementar DLQ (Dead Letter Queue) para eventos orfaos e falhas de processamento (RF04).
-- [ ] **Task 3.6:** Implementar handler de Tombstones — processar `ABORT_PLAN` para invalidar `plan_id` no Redis e limpar buffers.
-- [ ] **Task 3.7:** Implementar Webhook/Dispatcher async para notificacao de clientes apos processamento.
-- [ ] **Task 3.8:** Registrar servico Go no Consul e configurar health checks.
+- [x] **Task 3.1:** Inicializar modulo Go e configurar consumidor Kafka com **franz-go** (ADR-001).
+- [x] **Task 3.2:** Desenvolver Script Lua (`check_and_set_seq.lua`) no Redis para validacao de sequencia atomica, com testes isolados do script.
+- [x] **Task 3.3:** Implementar logica de Waiting Room (buffer) no Redis para eventos fora de ordem, com TTL de 1h e encaminhamento para DLQ na expiracao. (Nota: DLQ na expiração proativa em progresso).
+- [x] **Task 3.4:** Implementar transacao ACID no Postgres (Update Order + Insert Outbox) em boundary transacional unico.
+- [x] **Task 3.5:** Implementar DLQ (Dead Letter Queue) para eventos orfaos e falhas de processamento (RF04).
+- [x] **Task 3.6:** Implementar handler de Tombstones — processar `ABORT_PLAN` para invalidar `plan_id` no Redis e limpar buffers.
+- [x] **Task 3.7:** Implementar Webhook/Dispatcher async para notificacao de clientes apos processamento.
+- [x] **Task 3.8:** Registrar servico Go no Consul e configurar health checks.
 
 ## 🟡 Fase 4: Coordenacao e Resiliencia
 

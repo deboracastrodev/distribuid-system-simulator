@@ -43,3 +43,17 @@ agent-dry-run: ## Gera eventos sem publicar no Kafka
 
 agent-order: ## Publica pedido custom (ex: make agent-order ORDER='{"user_id":"u1","items":[...],"total_amount":10}')
 	@docker compose run --rm agent python -m src.main --order '$(ORDER)'
+
+# --- Server Go ---
+
+server-build: ## Builda a imagem do server Go
+	@docker compose build server
+
+server-up: ## Sobe o server Go (e dependências)
+	@docker compose up -d server
+
+server-logs: ## Segue logs do server Go
+	@docker compose logs -f server
+
+server-restart: ## Reinicia o server Go
+	@docker compose restart server

@@ -6,3 +6,9 @@ _bmad/
 steps.md
 _bmad-output/
 .github/
+.env
+server/.env
+
+
+.env
+server/.env

@@ -72,6 +72,38 @@ services:
       timeout: 3s
       retries: 5
 
+  # --- SERVER GO (Event Processor / Exactly-Once Engine) ---
+  server:
+    build: ./server
+    container_name: nexus-server
+    depends_on:
+      kafka:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+      consul:
+        condition: service_healthy
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+      KAFKA_TOPIC: orders
+      KAFKA_DLQ_TOPIC: orders-dlq
+      KAFKA_CONSUMER_GROUP: nexus-server-group
+      REDIS_ADDR: redis:6379
+      REDIS_PASSWORD: nexus_pass
+      POSTGRES_DSN: postgres://nexus_user:nexus_pass@postgres:5432/nexus_db?sslmode=disable
+      CONSUL_ADDR: consul:8500
+      OTEL_EXPORTER_OTLP_ENDPOINT: jaeger:4317
+      OTEL_SERVICE_NAME: nexus-server
+    ports:
+      - "8080:8080"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:8080/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
   # --- AGENTE PLANNER (Python + LangGraph) ---
   agent:
     build: ./agent
