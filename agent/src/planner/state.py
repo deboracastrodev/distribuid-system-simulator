@@ -7,7 +7,7 @@ from typing import TypedDict
 
 class PlanState(TypedDict):
     order_id: str           # UUID do pedido
-    plan_id: str            # "plan_{uuid4_hex[:12]}"
+    plan_id: str            # "plan_{uuid4_hex[:16]}"
     user_id: str
     items: list[dict]
     total_amount: float
@@ -15,3 +15,4 @@ class PlanState(TypedDict):
     current_seq: int        # Contador de sequencia
     events: list[dict]      # Eventos gerados (buffer antes de publish)
     status: str             # "planning" | "publishing" | "done" | "aborted"
+    abort_reason: str       # Motivo do abort (vazio se nao abortado)

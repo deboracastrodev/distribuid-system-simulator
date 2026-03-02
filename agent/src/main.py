@@ -17,9 +17,15 @@ from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import BatchSpanProcessor
 from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import OTLPSpanExporter
 
-from src.config import OTEL_EXPORTER_OTLP_ENDPOINT, OTEL_SERVICE_NAME
+from src.config import (
+    OTEL_EXPORTER_OTLP_ENDPOINT,
+    OTEL_EXPORTER_OTLP_INSECURE,
+    OTEL_SERVICE_NAME,
+    validate_config,
+)
+from src.models.events import generate_plan_id
 from src.planner.graph import build_graph
-from src.producer.kafka_producer import create_producer, publish_plan
+from src.producer.kafka_producer import check_kafka_connectivity, create_producer, publish_plan
 
 logging.basicConfig(
     level=logging.INFO,
@@ -32,19 +38,19 @@ def setup_tracing() -> None:
     """Configura OpenTelemetry com exporter OTLP para Jaeger."""
     resource = Resource.create({"service.name": OTEL_SERVICE_NAME})
     provider = TracerProvider(resource=resource)
-    exporter = OTLPSpanExporter(endpoint=OTEL_EXPORTER_OTLP_ENDPOINT, insecure=True)
+    exporter = OTLPSpanExporter(
+        endpoint=OTEL_EXPORTER_OTLP_ENDPOINT,
+        insecure=OTEL_EXPORTER_OTLP_INSECURE,
+    )
     provider.add_span_processor(BatchSpanProcessor(exporter))
     trace.set_tracer_provider(provider)
 
 
-def run_plan(order: dict) -> None:
-    """Executa o plano completo para um pedido."""
-    plan_id = f"plan_{uuid.uuid4().hex[:12]}"
-    order_id = order.get("order_id", str(uuid.uuid4()))
-
-    initial_state = {
-        "order_id": order_id,
-        "plan_id": plan_id,
+def _build_initial_state(order: dict) -> dict:
+    """Constroi estado inicial do plano a partir de um pedido."""
+    return {
+        "order_id": order.get("order_id", str(uuid.uuid4())),
+        "plan_id": generate_plan_id(),
         "user_id": order["user_id"],
         "items": order["items"],
         "total_amount": order["total_amount"],
@@ -52,29 +58,51 @@ def run_plan(order: dict) -> None:
         "current_seq": 0,
         "events": [],
         "status": "planning",
+        "abort_reason": "",
     }
 
-    logger.info("Iniciando plano %s para order %s", plan_id, order_id)
 
-    graph = build_graph()
-    result = graph.invoke(initial_state)
+def run_plan(order: dict) -> None:
+    """Executa o plano completo para um pedido."""
+    tracer = trace.get_tracer(__name__)
 
-    events = result["events"]
-    status = result["status"]
+    with tracer.start_as_current_span("run-plan") as span:
+        state = _build_initial_state(order)
+        span.set_attribute("plan.id", state["plan_id"])
+        span.set_attribute("order.id", state["order_id"])
 
-    if not events:
-        logger.warning("Nenhum evento gerado para plano %s", plan_id)
-        return
+        logger.info("Iniciando plano %s para order %s", state["plan_id"], state["order_id"])
 
-    logger.info(
-        "Plano %s: %d eventos gerados (status=%s)", plan_id, len(events), status
-    )
+        graph = build_graph()
+        result = graph.invoke(state)
 
-    # Publicar no Kafka
-    producer = create_producer()
-    publish_plan(producer, events)
+        events = result["events"]
+        status = result["status"]
 
-    logger.info("Plano %s finalizado", plan_id)
+        if not events:
+            logger.warning("Nenhum evento gerado para plano %s", state["plan_id"])
+            return
+
+        logger.info(
+            "Plano %s: %d eventos gerados (status=%s)", state["plan_id"], len(events), status
+        )
+
+        producer = create_producer()
+        publish_plan(producer, events)
+
+        logger.info("Plano %s finalizado", state["plan_id"])
+
+
+def _default_order() -> dict:
+    return {
+        "user_id": "usr_demo_001",
+        "items": [
+            {"product_id": "prod_abc", "quantity": 2, "unit_price": 49.90},
+            {"product_id": "prod_xyz", "quantity": 1, "unit_price": 149.90},
+        ],
+        "total_amount": 249.70,
+        "currency": "BRL",
+    }
 
 
 def main() -> None:
@@ -87,10 +115,11 @@ def main() -> None:
     parser.add_argument(
         "--dry-run",
         action="store_true",
-        help="Gera eventos mas nao publica no Kafka",
+        help="Gera eventos sem publicar. Valida conectividade com Kafka.",
     )
     args = parser.parse_args()
 
+    validate_config()
     setup_tracing()
 
     if args.order:
@@ -100,35 +129,22 @@ def main() -> None:
         else:
             order = json.loads(args.order)
     else:
-        # Pedido exemplo para dev/teste
-        order = {
-            "user_id": "usr_demo_001",
-            "items": [
-                {"product_id": "prod_abc", "quantity": 2, "unit_price": 49.90},
-                {"product_id": "prod_xyz", "quantity": 1, "unit_price": 149.90},
-            ],
-            "total_amount": 249.70,
-            "currency": "BRL",
-        }
+        order = _default_order()
         logger.info("Usando pedido de exemplo (nenhum --order fornecido)")
 
     if args.dry_run:
-        plan_id = f"plan_{uuid.uuid4().hex[:12]}"
-        order_id = order.get("order_id", str(uuid.uuid4()))
-        initial_state = {
-            "order_id": order_id,
-            "plan_id": plan_id,
-            "user_id": order["user_id"],
-            "items": order["items"],
-            "total_amount": order["total_amount"],
-            "currency": order.get("currency", "BRL"),
-            "current_seq": 0,
-            "events": [],
-            "status": "planning",
-        }
+        # Validar conectividade com dependencias
+        kafka_ok = check_kafka_connectivity()
+        if not kafka_ok:
+            logger.error("dry-run: Kafka inacessivel — verifique se os containers estao rodando")
+
+        state = _build_initial_state(order)
         graph = build_graph()
-        result = graph.invoke(initial_state)
+        result = graph.invoke(state)
         print(json.dumps(result["events"], indent=2, ensure_ascii=False))
+
+        if kafka_ok:
+            logger.info("dry-run: Kafka OK, eventos nao publicados")
         return
 
     run_plan(order)

@@ -11,6 +11,8 @@ from typing import Optional
 
 from pydantic import BaseModel, Field
 
+SCHEMA_VERSION = "1.0"
+
 
 # --- Data payloads (campo "data" do envelope) ---
 
@@ -70,6 +72,7 @@ class EventEnvelope(BaseModel):
     timestamp: str = Field(
         default_factory=lambda: datetime.now(timezone.utc).isoformat()
     )
+    schema_version: str = SCHEMA_VERSION
     data: dict
 
     def to_kafka_value(self) -> dict:
@@ -78,6 +81,11 @@ class EventEnvelope(BaseModel):
         if d["seq_id"] is None:
             del d["seq_id"]
         return d
+
+
+def generate_plan_id() -> str:
+    """Gera plan_id com prefixo + 16 chars hex (seguro contra colisoes)."""
+    return f"plan_{uuid.uuid4().hex[:16]}"
 
 
 # Mapeamento tipo -> classe de data para validacao

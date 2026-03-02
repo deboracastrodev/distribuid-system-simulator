@@ -15,10 +15,10 @@ Decisoes tecnologicas baseadas nos ADRs registrados em `docs/blueprint-arquitetu
 
 ## 🔵 Fase 2: O Cerebro Agentico (Python)
 
-- [ ] **Task 2.1:** Configurar ambiente Python (venv/poetry) com dependencias LangGraph e kafka-python.
-- [ ] **Task 2.2:** Criar Agent Planner com LangGraph para gerar sequencias de eventos com `plan_id` e `seq_id` unicos.
-- [ ] **Task 2.3:** Integrar Producer Kafka no Python com ordering key (`order_id`) e injecao de headers (`traceparent`).
-- [ ] **Task 2.4:** Implementar evento `ABORT_PLAN` (Tombstone) para invalidacao de planos no Redis.
+- [x] **Task 2.1:** Configurar ambiente Python (venv/poetry) com dependencias LangGraph e kafka-python.
+- [x] **Task 2.2:** Criar Agent Planner com LangGraph para gerar sequencias de eventos com `plan_id` e `seq_id` unicos.
+- [x] **Task 2.3:** Integrar Producer Kafka no Python com ordering key (`order_id`) e injecao de headers (`traceparent`).
+- [x] **Task 2.4:** Implementar evento `ABORT_PLAN` (Tombstone) para invalidacao de planos no Redis.
 
 ## 🔴 Fase 3: O Coracao de Go
 

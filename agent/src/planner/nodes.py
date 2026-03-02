@@ -8,6 +8,7 @@ from __future__ import annotations
 import uuid
 from datetime import datetime, timezone, timedelta
 
+from src.config import ORDER_MAX_AMOUNT
 from src.models.events import (
     AbortPlanData,
     EventEnvelope,
@@ -33,11 +34,17 @@ def _make_envelope(state: PlanState, event_type: str, data: dict, seq: int) -> d
 
 
 def generate_plan(state: PlanState) -> dict:
-    """Inicializa o plano — valida inputs e prepara estado."""
+    """Inicializa o plano — valida inputs e regras de negocio."""
     if not state["items"]:
-        return {"status": "aborted"}
+        return {"status": "aborted", "abort_reason": "items_empty"}
     if state["total_amount"] <= 0:
-        return {"status": "aborted"}
+        return {"status": "aborted", "abort_reason": "invalid_amount"}
+    if state["total_amount"] > ORDER_MAX_AMOUNT:
+        return {"status": "aborted", "abort_reason": "amount_exceeds_limit"}
+    # Validar que total bate com soma dos items
+    calculated = sum(i["quantity"] * i["unit_price"] for i in state["items"])
+    if abs(calculated - state["total_amount"]) > 0.01:
+        return {"status": "aborted", "abort_reason": "amount_mismatch"}
     return {"status": "planning", "current_seq": 0, "events": []}
 
 
@@ -122,9 +129,18 @@ def create_completion_event(state: PlanState) -> dict:
 
 def abort_plan(state: PlanState) -> dict:
     """Gera evento ABORT_PLAN (tombstone, sem seq_id)."""
+    reason = state.get("abort_reason", "unknown")
+    code_map = {
+        "items_empty": "manual",
+        "invalid_amount": "manual",
+        "amount_exceeds_limit": "manual",
+        "amount_mismatch": "manual",
+        "inventory_failed": "inventory_failed",
+        "payment_rejected": "payment_rejected",
+    }
     data = AbortPlanData(
-        reason="Validacao do plano falhou",
-        abort_code="manual",
+        reason=f"Validacao do plano falhou: {reason}",
+        abort_code=code_map.get(reason, "manual"),
         aborted_at_seq=state["current_seq"],
     )
     envelope = EventEnvelope(

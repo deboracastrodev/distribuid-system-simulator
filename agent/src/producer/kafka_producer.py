@@ -5,8 +5,9 @@ from __future__ import annotations
 import json
 import logging
 
-from confluent_kafka import Producer
+from confluent_kafka import KafkaException, Producer
 from opentelemetry import trace
+from opentelemetry.context import get_current
 
 from src.config import KAFKA_BOOTSTRAP_SERVERS, KAFKA_TOPIC
 
@@ -39,40 +40,50 @@ def create_producer() -> Producer:
     )
 
 
-def _build_traceparent() -> str:
-    """Gera header traceparent W3C via OpenTelemetry SDK."""
-    span = trace.get_current_span()
+def check_kafka_connectivity() -> bool:
+    """Verifica conectividade basica com o Kafka. Retorna True se OK."""
+    try:
+        producer = create_producer()
+        metadata = producer.list_topics(timeout=5)
+        logger.info("Kafka conectado: %d brokers, %d topics",
+                     len(metadata.brokers), len(metadata.topics))
+        return True
+    except KafkaException as e:
+        logger.error("Kafka inacessivel: %s", e)
+        return False
+
+
+def _build_traceparent(span: trace.Span) -> str:
+    """Extrai traceparent W3C do span ativo (sem criar spans efemeros)."""
     ctx = span.get_span_context()
-    if ctx.is_valid:
-        return f"00-{format(ctx.trace_id, '032x')}-{format(ctx.span_id, '016x')}-01"
-    # Fallback: criar span efemero para gerar IDs
-    with tracer.start_as_current_span("generate-traceparent") as s:
-        c = s.get_span_context()
-        return f"00-{format(c.trace_id, '032x')}-{format(c.span_id, '016x')}-01"
-
-
-def publish_event(producer: Producer, event: dict) -> None:
-    """Publica um unico evento no Kafka com ordering key e traceparent."""
-    traceparent = _build_traceparent()
-    producer.produce(
-        topic=KAFKA_TOPIC,
-        key=event["order_id"],
-        value=json.dumps(event).encode(),
-        headers=[("traceparent", traceparent.encode())],
-        callback=_delivery_callback,
-    )
-    producer.poll(0)
+    return f"00-{format(ctx.trace_id, '032x')}-{format(ctx.span_id, '016x')}-01"
 
 
 def publish_plan(producer: Producer, events: list[dict]) -> None:
     """Publica todos os eventos de um plano em sequencia e faz flush."""
-    with tracer.start_as_current_span("publish-plan") as span:
+    with tracer.start_as_current_span("publish-plan") as plan_span:
         plan_id = events[0]["plan_id"] if events else "unknown"
-        span.set_attribute("plan.id", plan_id)
-        span.set_attribute("plan.event_count", len(events))
+        plan_span.set_attribute("plan.id", plan_id)
+        plan_span.set_attribute("plan.event_count", len(events))
 
         for event in events:
-            publish_event(producer, event)
+            with tracer.start_as_current_span(
+                f"publish-event-{event.get('event_type', 'unknown')}"
+            ) as event_span:
+                event_span.set_attribute("event.type", event.get("event_type", ""))
+                event_span.set_attribute("event.seq_id", event.get("seq_id", 0))
+
+                traceparent = _build_traceparent(event_span)
+                producer.produce(
+                    topic=KAFKA_TOPIC,
+                    key=event["order_id"],
+                    value=json.dumps(event).encode(),
+                    headers=[("traceparent", traceparent.encode())],
+                    callback=_delivery_callback,
+                )
+
+        # Processar callbacks pendentes de uma vez (nao dentro do loop)
+        producer.poll(0)
 
         remaining = producer.flush(timeout=10)
         if remaining > 0:
