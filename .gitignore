@@ -12,3 +12,5 @@ server/.env
 
 .env
 server/.env
+server/.go
+server/.go-cache

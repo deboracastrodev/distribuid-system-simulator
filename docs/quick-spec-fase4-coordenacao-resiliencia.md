@@ -62,13 +62,16 @@ Este documento detalha a implementação do Service Discovery via Consul DNS e a
 - `docker-compose.yml`: Configuração de DNS e migração para `.service.consul`.
 - `server/cmd/server/main.go`: Inicialização resiliente do Consul KV e registro de serviço.
 - `server/internal/consul/kv.go`: Implementação do watcher de configurações do Consul.
-- `server/internal/dispatcher/dispatcher.go`: Implementação do Circuit Breaker dinâmico.
+- `server/internal/consul/kv_test.go`: Testes de unidade para robustez do watcher.
+- `server/internal/dispatcher/dispatcher.go`: Implementação do Circuit Breaker dinâmico com interface para o repositório.
+- `server/internal/dispatcher/dispatcher_test.go`: Testes de integração do Circuit Breaker com mock server.
 - `server/go.mod`: Adição de `gobreaker` e `consul/api`.
 
 ### 6.2. Change Log
-- **Fix (Critical):** Resolvido risco de panic no startup se o Consul estiver offline.
-- **Fix (Critical):** Implementado Circuit Breaker dinâmico; agora reage a mudanças no KV sem restart.
-- **Fix (High):** Corrigido Service Discovery; variáveis de ambiente agora usam nomes Consul.
-- **Fix (Medium):** Timeout do HTTP Client agora segue a configuração do Consul KV.
-- **Improvement:** Adicionado suporte a `dns_search` para resolução simplificada de serviços.
+- **Fix (Critical):** Resolvido risco real de panic no startup. Agora o Dispatcher e o Watcher possuem fallbacks seguros caso o Consul esteja offline.
+- **Fix (High):** Adicionados testes de unidade e integração para validar a lógica do Circuit Breaker e do Consul KV.
+- **Fix (High):** Implementada interface `OutboxRepository` para desacoplar o dispatcher do banco de dados e facilitar testes.
+- **Fix (Medium):** Corrigido Circuit Breaker; agora utiliza TODAS as configurações do Consul KV (`webhook_open_duration_seconds`, `webhook_success_threshold`).
+- **Fix (Medium):** Removido efeito colateral no `httpClient`; timeouts agora são aplicados via contexto por requisição.
+- **Improvement:** Melhorada a responsividade do shutdown do Dispatcher utilizando `select` com `ctx.Done()`.
 

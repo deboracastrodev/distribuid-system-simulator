@@ -77,17 +77,12 @@ func main() {
 	// --- Consul KV Watcher (Circuit Breaker config) ---
 	kvWatcher, err := consulkv.NewKVWatcher(cfg.ConsulAddr)
 	if err != nil {
-	        slog.Warn("Consul KV watcher init failed, using defaults", "error", err)
-	        // If it fails, we still need a watcher instance to avoid panics, 
-	        // but it might not be able to reload from Consul.
+		slog.Warn("Consul KV watcher init failed, using defaults", "error", err)
 	}
+	kvWatcher.SeedDefaults()
 
-	if kvWatcher != nil {
-	        kvWatcher.SeedDefaults()
-	}
 	// --- Outbox Dispatcher (with Circuit Breaker) ---
 	disp := dispatcher.New(repo, cfg.WebhookURL, cfg.OutboxPollInterval, cfg.WebhookRetryMax, cfg.WebhookRetryDelay, kvWatcher)
-
 	// --- Consul Registration ---
 	consulClient, serviceID, err := registerConsul(cfg)
 	if err != nil {

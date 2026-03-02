@@ -14,8 +14,13 @@ import (
 	"github.com/user/nexus-server/internal/db"
 )
 
+type OutboxRepository interface {
+	FetchUnprocessedOutbox(ctx context.Context, limit int) ([]db.OutboxEntry, error)
+	MarkOutboxProcessed(ctx context.Context, id string) error
+}
+
 type Dispatcher struct {
-	repo         *db.Repository
+	repo         OutboxRepository
 	webhookURL   string
 	httpClient   *http.Client
 	pollInterval time.Duration
@@ -25,7 +30,7 @@ type Dispatcher struct {
 	kvWatcher    *consulkv.KVWatcher
 }
 
-func New(repo *db.Repository, webhookURL string, pollInterval time.Duration, retryMax int, retryDelay time.Duration, kvWatcher *consulkv.KVWatcher) *Dispatcher {
+func New(repo OutboxRepository, webhookURL string, pollInterval time.Duration, retryMax int, retryDelay time.Duration, kvWatcher *consulkv.KVWatcher) *Dispatcher {
 	d := &Dispatcher{
 		repo:         repo,
 		webhookURL:   webhookURL,
@@ -42,8 +47,11 @@ func New(repo *db.Repository, webhookURL string, pollInterval time.Duration, ret
 }
 
 func (d *Dispatcher) newCircuitBreaker() *gobreaker.CircuitBreaker[*http.Response] {
+	cfg := d.kvWatcher.Config()
 	settings := gobreaker.Settings{
-		Name: "webhook-dispatcher",
+		Name:        "webhook-dispatcher",
+		MaxRequests: cfg.SuccessThreshold,
+		Timeout:     cfg.OpenDuration,
 		ReadyToTrip: func(counts gobreaker.Counts) bool {
 			threshold := d.kvWatcher.Config().FailureThreshold
 			return counts.ConsecutiveFailures >= threshold
@@ -115,7 +123,12 @@ func (d *Dispatcher) dispatch(ctx context.Context, entry db.OutboxEntry) error {
 				return fmt.Errorf("circuit breaker open: %w", err)
 			}
 			slog.Warn("webhook attempt failed", "attempt", attempt, "max", d.retryMax, "error", err)
-			time.Sleep(d.retryDelay * time.Duration(attempt))
+			
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(d.retryDelay * time.Duration(attempt)):
+			}
 			continue
 		}
 
@@ -127,7 +140,12 @@ func (d *Dispatcher) dispatch(ctx context.Context, entry db.OutboxEntry) error {
 
 		lastErr = fmt.Errorf("webhook returned status %d", resp.StatusCode)
 		slog.Warn("webhook non-2xx", "attempt", attempt, "status", resp.StatusCode)
-		time.Sleep(d.retryDelay * time.Duration(attempt))
+		
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(d.retryDelay * time.Duration(attempt)):
+		}
 	}
 
 	return fmt.Errorf("webhook failed after %d attempts: %w", d.retryMax, lastErr)
@@ -135,9 +153,12 @@ func (d *Dispatcher) dispatch(ctx context.Context, entry db.OutboxEntry) error {
 
 func (d *Dispatcher) doHTTP(ctx context.Context, entry db.OutboxEntry) (*http.Response, error) {
 	cfg := d.kvWatcher.Config()
-	d.httpClient.Timeout = cfg.Timeout
+	
+	// Use a context with timeout for the individual request instead of modifying the shared client
+	reqCtx, cancel := context.WithTimeout(ctx, cfg.Timeout)
+	defer cancel()
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, d.webhookURL, bytes.NewReader(entry.Payload))
+	req, err := http.NewRequestWithContext(reqCtx, http.MethodPost, d.webhookURL, bytes.NewReader(entry.Payload))
 	if err != nil {
 		return nil, fmt.Errorf("creating request: %w", err)
 	}

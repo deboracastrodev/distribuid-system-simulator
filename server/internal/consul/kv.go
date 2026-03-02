@@ -46,17 +46,17 @@ type KVWatcher struct {
 }
 
 func NewKVWatcher(consulAddr string) (*KVWatcher, error) {
+	w := &KVWatcher{
+		config: DefaultCBConfig(),
+	}
+
 	cfg := consulapi.DefaultConfig()
 	cfg.Address = consulAddr
 	client, err := consulapi.NewClient(cfg)
 	if err != nil {
-		return nil, fmt.Errorf("creating consul KV client: %w", err)
+		return w, fmt.Errorf("creating consul KV client: %w", err)
 	}
-
-	w := &KVWatcher{
-		client: client,
-		config: DefaultCBConfig(),
-	}
+	w.client = client
 
 	// Initial load
 	w.reload()
@@ -66,6 +66,9 @@ func NewKVWatcher(consulAddr string) (*KVWatcher, error) {
 
 // Config returns a snapshot of the current CB config (thread-safe).
 func (w *KVWatcher) Config() CBConfig {
+	if w == nil {
+		return DefaultCBConfig()
+	}
 	w.mu.RLock()
 	defer w.mu.RUnlock()
 	return w.config
@@ -73,6 +76,9 @@ func (w *KVWatcher) Config() CBConfig {
 
 // SeedDefaults writes default values to Consul KV if they don't exist yet.
 func (w *KVWatcher) SeedDefaults() {
+	if w.client == nil {
+		return
+	}
 	kv := w.client.KV()
 	defaults := map[string]string{
 		KeyFailureThreshold: "5",
@@ -82,16 +88,28 @@ func (w *KVWatcher) SeedDefaults() {
 	}
 
 	for key, val := range defaults {
-		existing, _, _ := kv.Get(key, nil)
+		existing, _, err := kv.Get(key, nil)
+		if err != nil {
+			slog.Error("failed to check Consul KV key", "key", key, "error", err)
+			continue
+		}
 		if existing == nil {
-			kv.Put(&consulapi.KVPair{Key: key, Value: []byte(val)}, nil)
-			slog.Info("seeded Consul KV default", "key", key, "value", val)
+			_, err := kv.Put(&consulapi.KVPair{Key: key, Value: []byte(val)}, nil)
+			if err != nil {
+				slog.Error("failed to seed Consul KV default", "key", key, "error", err)
+			} else {
+				slog.Info("seeded Consul KV default", "key", key, "value", val)
+			}
 		}
 	}
 }
 
 // Watch polls Consul KV for config changes. Blocks until ctx is cancelled.
 func (w *KVWatcher) Watch(ctx context.Context, interval time.Duration) {
+	if w.client == nil {
+		slog.Warn("consul KV watcher disabled (no client)")
+		return
+	}
 	slog.Info("consul KV watcher started", "interval", interval)
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
@@ -108,20 +126,41 @@ func (w *KVWatcher) Watch(ctx context.Context, interval time.Duration) {
 }
 
 func (w *KVWatcher) reload() {
+	if w.client == nil {
+		return
+	}
 	kv := w.client.KV()
 	newCfg := DefaultCBConfig()
 
-	if v := w.getUint32(kv, KeyFailureThreshold); v > 0 {
+	// Track if we had any errors during reload
+	hasErrors := false
+
+	if v, err := w.getUint32(kv, KeyFailureThreshold); err == nil && v > 0 {
 		newCfg.FailureThreshold = v
+	} else if err != nil {
+		hasErrors = true
 	}
-	if v := w.getUint32(kv, KeySuccessThreshold); v > 0 {
+
+	if v, err := w.getUint32(kv, KeySuccessThreshold); err == nil && v > 0 {
 		newCfg.SuccessThreshold = v
+	} else if err != nil {
+		hasErrors = true
 	}
-	if v := w.getDuration(kv, KeyTimeout); v > 0 {
+
+	if v, err := w.getDuration(kv, KeyTimeout); err == nil && v > 0 {
 		newCfg.Timeout = v
+	} else if err != nil {
+		hasErrors = true
 	}
-	if v := w.getDuration(kv, KeyOpenDuration); v > 0 {
+
+	if v, err := w.getDuration(kv, KeyOpenDuration); err == nil && v > 0 {
 		newCfg.OpenDuration = v
+	} else if err != nil {
+		hasErrors = true
+	}
+
+	if hasErrors {
+		slog.Warn("partial failure reloading Consul KV config, keeping some defaults/last known")
 	}
 
 	w.mu.Lock()
@@ -139,26 +178,32 @@ func (w *KVWatcher) reload() {
 	}
 }
 
-func (w *KVWatcher) getUint32(kv *consulapi.KV, key string) uint32 {
+func (w *KVWatcher) getUint32(kv *consulapi.KV, key string) (uint32, error) {
 	pair, _, err := kv.Get(key, nil)
-	if err != nil || pair == nil {
-		return 0
+	if err != nil {
+		return 0, err
+	}
+	if pair == nil {
+		return 0, nil
 	}
 	n, err := strconv.ParseUint(string(pair.Value), 10, 32)
 	if err != nil {
-		return 0
+		return 0, fmt.Errorf("parsing %s: %w", key, err)
 	}
-	return uint32(n)
+	return uint32(n), nil
 }
 
-func (w *KVWatcher) getDuration(kv *consulapi.KV, key string) time.Duration {
+func (w *KVWatcher) getDuration(kv *consulapi.KV, key string) (time.Duration, error) {
 	pair, _, err := kv.Get(key, nil)
-	if err != nil || pair == nil {
-		return 0
+	if err != nil {
+		return 0, err
+	}
+	if pair == nil {
+		return 0, nil
 	}
 	secs, err := strconv.Atoi(string(pair.Value))
 	if err != nil {
-		return 0
+		return 0, fmt.Errorf("parsing %s: %w", key, err)
 	}
-	return time.Duration(secs) * time.Second
+	return time.Duration(secs) * time.Second, nil
 }

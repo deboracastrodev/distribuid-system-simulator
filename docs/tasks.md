@@ -33,8 +33,8 @@ Decisoes tecnologicas baseadas nos ADRs registrados em `docs/blueprint-arquitetu
 
 ## 🟡 Fase 4: Coordenacao e Resiliencia
 
-- [ ] **Task 4.1:** Configurar Service Discovery via Consul DNS para comunicacao entre servicos.
-- [ ] **Task 4.2:** Implementar Circuit Breaker com configuracoes armazenadas no Consul KV.
+- [x] **Task 4.1:** Configurar Service Discovery via Consul DNS para comunicacao entre servicos.
+- [x] **Task 4.2:** Implementar Circuit Breaker com configuracoes armazenadas no Consul KV.
 
 ## 🟣 Fase 5: Observabilidade e Prova de Conceito
 
