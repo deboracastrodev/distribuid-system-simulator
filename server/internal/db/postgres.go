@@ -55,18 +55,36 @@ func (r *Repository) ProcessEvent(ctx context.Context, event *models.EventEnvelo
 		seqID = *event.SeqID
 	}
 
-	// Idempotent update: only update if seq_id > last_seq_processed
+	// Extract optional fields from event data
+	userID := "unknown"
+	if u, ok := event.Data["user_id"].(string); ok {
+		userID = u
+	}
+	
+	var totalAmount *float64
+	if am, ok := event.Data["total_amount"].(float64); ok {
+		totalAmount = &am
+	}
+
+	// Upsert with idempotency check: only update if seq_id > last_seq_processed
+	// We use COALESCE for user_id and total_amount to avoid overwriting with defaults if they are missing in subsequent events
 	tag, err := tx.Exec(ctx, `
-		UPDATE orders
-		SET status = $1, plan_id = $2, last_seq_processed = $3, updated_at = NOW()
-		WHERE id = $4::uuid AND last_seq_processed < $3
-	`, newStatus, event.PlanID, seqID, event.OrderID)
+		INSERT INTO orders (id, user_id, status, plan_id, total_amount, last_seq_processed, created_at, updated_at)
+		VALUES ($4::uuid, $5, $1, $2, $6, $3, NOW(), NOW())
+		ON CONFLICT (id) DO UPDATE
+		SET status = EXCLUDED.status,
+		    plan_id = EXCLUDED.plan_id,
+		    total_amount = COALESCE(EXCLUDED.total_amount, orders.total_amount),
+		    last_seq_processed = EXCLUDED.last_seq_processed,
+		    updated_at = NOW()
+		WHERE orders.last_seq_processed < EXCLUDED.last_seq_processed
+	`, newStatus, event.PlanID, seqID, event.OrderID, userID, totalAmount)
 	if err != nil {
-		return false, fmt.Errorf("update order: %w", err)
+		return false, fmt.Errorf("upsert order: %w", err)
 	}
 
 	if tag.RowsAffected() == 0 {
-		slog.Info("duplicate event skipped in DB", "order_id", event.OrderID, "seq_id", seqID)
+		slog.Info("duplicate event skipped in DB (idempotency)", "order_id", event.OrderID, "seq_id", seqID)
 		return false, nil
 	}
 

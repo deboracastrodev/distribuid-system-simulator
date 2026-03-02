@@ -57,3 +57,41 @@ server-logs: ## Segue logs do server Go
 
 server-restart: ## Reinicia o server Go
 	@docker compose restart server
+
+server-test: ## Roda testes unitários do Go e script Lua (requer env)
+	@cd server && go test ./... -v
+
+server-lint: ## Roda o linter (golangci-lint se disponível)
+	@cd server && golangci-lint run ./... || echo "Linter not installed"
+
+# --- Debug & Monitoring ---
+
+redis-cli: ## Acessa o Redis local
+	@docker compose exec redis redis-cli -a nexus_pass
+
+redis-monitor: ## Monitora comandos Redis em tempo real (veja o Script Lua rodando!)
+	@docker compose exec redis redis-cli -a nexus_pass monitor
+
+db-cli: ## Acessa o Postgres local
+	@docker compose exec postgres psql -U nexus_user -d nexus_db
+
+kafka-topics: ## Lista tópicos Kafka
+	@docker compose exec kafka /opt/kafka/bin/kafka-topics.sh --list --bootstrap-server localhost:29092
+
+kafka-consume: ## Consome eventos do tópico orders (debug manual)
+	@docker compose exec kafka /opt/kafka/bin/kafka-console-consumer.sh --bootstrap-server localhost:29092 --topic orders --from-beginning
+
+kafka-dlq: ## Consome eventos da DLQ
+	@docker compose exec kafka /opt/kafka/bin/kafka-console-consumer.sh --bootstrap-server localhost:29092 --topic orders-dlq --from-beginning
+
+# --- Validação E2E (Fluxo Completo) ---
+
+demo-full: up ## Sobe infra e executa agent para gerar fluxo completo
+	@echo "Aguardando infra... (5s)"
+	@sleep 5
+	@$(MAKE) agent-run
+	@echo "Fluxo gerado! Verifique logs com 'make server-logs' e banco com 'make db-check'"
+
+db-check: ## Mostra estado atual dos pedidos no banco
+	@docker compose exec postgres psql -U nexus_user -d nexus_db -c "SELECT id, status, last_seq_processed, updated_at FROM orders ORDER BY updated_at DESC LIMIT 5;"
+	@docker compose exec postgres psql -U nexus_user -d nexus_db -c "SELECT id, event_type, processed, created_at FROM outbox ORDER BY created_at DESC LIMIT 5;"
