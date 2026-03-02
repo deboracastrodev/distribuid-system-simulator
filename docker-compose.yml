@@ -115,7 +115,7 @@ services:
       REDIS_ADDR: redis.service.consul:6379
       REDIS_PASSWORD: nexus_pass
       POSTGRES_DSN: postgres://nexus_user:nexus_pass@postgres.service.consul:5432/nexus_db?sslmode=disable
-      CONSUL_ADDR: consul.service.consul:8500
+      CONSUL_ADDR: 172.28.0.100:8500
       OTEL_EXPORTER_OTLP_ENDPOINT: jaeger:4317
       OTEL_SERVICE_NAME: nexus-server
     ports:
