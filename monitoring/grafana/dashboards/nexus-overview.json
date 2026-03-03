@@ -1,0 +1,226 @@
+{
+  "annotations": {
+    "list": []
+  },
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 0,
+  "id": null,
+  "links": [
+    {
+      "icon": "external link",
+      "title": "Abrir Jaeger UI",
+      "type": "link",
+      "url": "http://localhost:16686",
+      "targetBlank": true
+    },
+    {
+      "icon": "external link",
+      "title": "Grafana Explore (Jaeger)",
+      "type": "link",
+      "url": "/explore?orgId=1&left=%7B%22datasource%22:%22jaeger%22%7D",
+      "targetBlank": false
+    }
+  ],
+  "panels": [
+    {
+      "datasource": {
+        "type": "jaeger",
+        "uid": "jaeger"
+      },
+      "gridPos": { "h": 9, "w": 24, "x": 0, "y": 0 },
+      "id": 1,
+      "title": "Traces - Nexus Agent (run-plan)",
+      "type": "table",
+      "targets": [
+        {
+          "refId": "A",
+          "queryType": "search",
+          "service": "nexus-agent",
+          "operation": "run-plan",
+          "limit": 20
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {},
+        "overrides": [
+          {
+            "matcher": { "id": "byName", "options": "traceID" },
+            "properties": [
+              {
+                "id": "links",
+                "value": [
+                  {
+                    "title": "Ver trace no Jaeger",
+                    "url": "http://localhost:16686/trace/${__value.raw}",
+                    "targetBlank": true
+                  },
+                  {
+                    "title": "Ver trace no Explore",
+                    "url": "/explore?orgId=1&left={\"datasource\":\"jaeger\",\"queries\":[{\"refId\":\"A\",\"query\":\"${__value.raw}\"}]}",
+                    "targetBlank": false
+                  }
+                ]
+              }
+            ]
+          },
+          {
+            "matcher": { "id": "byName", "options": "Trace ID" },
+            "properties": [
+              {
+                "id": "links",
+                "value": [
+                  {
+                    "title": "Ver trace no Jaeger",
+                    "url": "http://localhost:16686/trace/${__value.raw}",
+                    "targetBlank": true
+                  },
+                  {
+                    "title": "Ver trace no Explore",
+                    "url": "/explore?orgId=1&left={\"datasource\":\"jaeger\",\"queries\":[{\"refId\":\"A\",\"query\":\"${__value.raw}\"}]}",
+                    "targetBlank": false
+                  }
+                ]
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "datasource": {
+        "type": "jaeger",
+        "uid": "jaeger"
+      },
+      "gridPos": { "h": 9, "w": 24, "x": 0, "y": 9 },
+      "id": 2,
+      "title": "Traces - Nexus Server (process-event)",
+      "type": "table",
+      "targets": [
+        {
+          "refId": "A",
+          "queryType": "search",
+          "service": "nexus-server",
+          "operation": "process-event",
+          "limit": 20
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {},
+        "overrides": [
+          {
+            "matcher": { "id": "byName", "options": "traceID" },
+            "properties": [
+              {
+                "id": "links",
+                "value": [
+                  {
+                    "title": "Ver trace no Jaeger",
+                    "url": "http://localhost:16686/trace/${__value.raw}",
+                    "targetBlank": true
+                  },
+                  {
+                    "title": "Ver trace no Explore",
+                    "url": "/explore?orgId=1&left={\"datasource\":\"jaeger\",\"queries\":[{\"refId\":\"A\",\"query\":\"${__value.raw}\"}]}",
+                    "targetBlank": false
+                  }
+                ]
+              }
+            ]
+          },
+          {
+            "matcher": { "id": "byName", "options": "Trace ID" },
+            "properties": [
+              {
+                "id": "links",
+                "value": [
+                  {
+                    "title": "Ver trace no Jaeger",
+                    "url": "http://localhost:16686/trace/${__value.raw}",
+                    "targetBlank": true
+                  },
+                  {
+                    "title": "Ver trace no Explore",
+                    "url": "/explore?orgId=1&left={\"datasource\":\"jaeger\",\"queries\":[{\"refId\":\"A\",\"query\":\"${__value.raw}\"}]}",
+                    "targetBlank": false
+                  }
+                ]
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "datasource": {
+        "type": "jaeger",
+        "uid": "jaeger"
+      },
+      "gridPos": { "h": 9, "w": 24, "x": 0, "y": 18 },
+      "id": 3,
+      "title": "Traces - ABORT_PLAN Events",
+      "type": "table",
+      "targets": [
+        {
+          "refId": "A",
+          "queryType": "search",
+          "service": "nexus-server",
+          "tags": "{\"event.type\":\"ABORT_PLAN\"}",
+          "limit": 20
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {},
+        "overrides": [
+          {
+            "matcher": { "id": "byName", "options": "traceID" },
+            "properties": [
+              {
+                "id": "links",
+                "value": [
+                  {
+                    "title": "Ver trace no Jaeger",
+                    "url": "http://localhost:16686/trace/${__value.raw}",
+                    "targetBlank": true
+                  },
+                  {
+                    "title": "Ver trace no Explore",
+                    "url": "/explore?orgId=1&left={\"datasource\":\"jaeger\",\"queries\":[{\"refId\":\"A\",\"query\":\"${__value.raw}\"}]}",
+                    "targetBlank": false
+                  }
+                ]
+              }
+            ]
+          },
+          {
+            "matcher": { "id": "byName", "options": "Trace ID" },
+            "properties": [
+              {
+                "id": "links",
+                "value": [
+                  {
+                    "title": "Ver trace no Jaeger",
+                    "url": "http://localhost:16686/trace/${__value.raw}",
+                    "targetBlank": true
+                  },
+                  {
+                    "title": "Ver trace no Explore",
+                    "url": "/explore?orgId=1&left={\"datasource\":\"jaeger\",\"queries\":[{\"refId\":\"A\",\"query\":\"${__value.raw}\"}]}",
+                    "targetBlank": false
+                  }
+                ]
+              }
+            ]
+          }
+        ]
+      }
+    }
+  ],
+  "schemaVersion": 39,
+  "tags": ["nexus", "observability"],
+  "templating": { "list": [] },
+  "time": { "from": "now-1h", "to": "now" },
+  "title": "Nexus Event Gateway - Overview",
+  "uid": "nexus-overview",
+  "version": 1
+}

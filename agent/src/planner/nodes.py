@@ -1,12 +1,16 @@
 """Node functions para o grafo LangGraph do Agent Planner.
 
 Cada node gera um evento, incrementa seq_id e append no buffer de eventos.
+Cada node é instrumentado com um span OTel filho, identificado pelo nome do node.
 """
 
 from __future__ import annotations
 
+import functools
 import uuid
 from datetime import datetime, timezone, timedelta
+
+from opentelemetry import trace
 
 from src.config import ORDER_MAX_AMOUNT
 from src.models.events import (
@@ -19,6 +23,24 @@ from src.models.events import (
     PaymentProcessedData,
 )
 from src.planner.state import PlanState
+
+_tracer = trace.get_tracer(__name__)
+
+
+def _traced_node(func):
+    """Decorador que cria um span OTel filho com o nome do node LangGraph."""
+    @functools.wraps(func)
+    def wrapper(state: PlanState) -> dict:
+        with _tracer.start_as_current_span(
+            f"node.{func.__name__}",
+            attributes={
+                "langgraph.node": func.__name__,
+                "plan.id": state.get("plan_id", ""),
+                "order.id": state.get("order_id", ""),
+            },
+        ):
+            return func(state)
+    return wrapper
 
 
 def _make_envelope(state: PlanState, event_type: str, data: dict, seq: int) -> dict:
@@ -33,6 +55,7 @@ def _make_envelope(state: PlanState, event_type: str, data: dict, seq: int) -> d
     return envelope.to_kafka_value()
 
 
+@_traced_node
 def generate_plan(state: PlanState) -> dict:
     """Inicializa o plano — valida inputs e regras de negocio."""
     if not state["items"]:
@@ -48,6 +71,7 @@ def generate_plan(state: PlanState) -> dict:
     return {"status": "planning", "current_seq": 0, "events": []}
 
 
+@_traced_node
 def create_order_event(state: PlanState) -> dict:
     """Gera evento OrderCreated (seq 1)."""
     seq = state["current_seq"] + 1
@@ -64,6 +88,7 @@ def create_order_event(state: PlanState) -> dict:
     }
 
 
+@_traced_node
 def create_inventory_event(state: PlanState) -> dict:
     """Gera evento InventoryValidated (seq 2)."""
     seq = state["current_seq"] + 1
@@ -80,6 +105,7 @@ def create_inventory_event(state: PlanState) -> dict:
     }
 
 
+@_traced_node
 def create_payment_event(state: PlanState) -> dict:
     """Gera evento PaymentProcessed (seq 3)."""
     seq = state["current_seq"] + 1
@@ -96,6 +122,7 @@ def create_payment_event(state: PlanState) -> dict:
     }
 
 
+@_traced_node
 def create_shipping_event(state: PlanState) -> dict:
     """Gera evento OrderShipped (seq 4)."""
     seq = state["current_seq"] + 1
@@ -112,6 +139,7 @@ def create_shipping_event(state: PlanState) -> dict:
     }
 
 
+@_traced_node
 def create_completion_event(state: PlanState) -> dict:
     """Gera evento OrderCompleted (seq 5)."""
     seq = state["current_seq"] + 1
@@ -127,6 +155,7 @@ def create_completion_event(state: PlanState) -> dict:
     }
 
 
+@_traced_node
 def abort_plan(state: PlanState) -> dict:
     """Gera evento ABORT_PLAN (tombstone, sem seq_id)."""
     reason = state.get("abort_reason", "unknown")

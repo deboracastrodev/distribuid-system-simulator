@@ -8,6 +8,8 @@ import (
 
 	"github.com/twmb/franz-go/pkg/kgo"
 	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/trace"
 
 	"github.com/user/nexus-server/internal/db"
 	"github.com/user/nexus-server/internal/dlq"
@@ -151,15 +153,19 @@ func (c *Consumer) handleRecord(ctx context.Context, record *kgo.Record) {
 		attribute.String("event.order_id", event.OrderID),
 	)
 
+	// Correlate logs with trace
+	traceID := span.SpanContext().TraceID().String()
 	slog.Info("event received",
 		"type", event.EventType,
 		"plan_id", event.PlanID,
 		"order_id", event.OrderID,
 		"offset", record.Offset,
+		"trace_id", traceID,
 	)
 
 	// Handle ABORT_PLAN tombstone
 	if event.EventType == "ABORT_PLAN" {
+		span.SetStatus(codes.Error, "plan aborted")
 		c.handleAbort(ctx, &event)
 		return
 	}
@@ -175,14 +181,24 @@ func (c *Consumer) handleRecord(ctx context.Context, record *kgo.Record) {
 
 func (c *Consumer) handleAbort(ctx context.Context, event *models.EventEnvelope) {
 	// 1. Invalidate plan in Redis and clear buffer
+	ctx, redisSpan := telemetry.Tracer.Start(ctx, "redis.abort-plan", trace.WithAttributes(
+		attribute.String("plan_id", event.PlanID),
+	))
 	if err := c.redis.AbortPlan(ctx, event.PlanID); err != nil {
+		redisSpan.SetStatus(codes.Error, err.Error())
 		slog.Error("redis abort failed", "plan_id", event.PlanID, "error", err)
 	}
+	redisSpan.End()
 
 	// 2. Mark order as aborted in Postgres
+	_, dbSpan := telemetry.Tracer.Start(ctx, "postgres.abort-order", trace.WithAttributes(
+		attribute.String("order_id", event.OrderID),
+	))
 	if err := c.repo.AbortOrder(ctx, event); err != nil {
+		dbSpan.SetStatus(codes.Error, err.Error())
 		slog.Error("db abort failed", "order_id", event.OrderID, "error", err)
 	}
+	dbSpan.End()
 
 	slog.Info("ABORT_PLAN processed", "plan_id", event.PlanID, "order_id", event.OrderID)
 }
@@ -190,12 +206,21 @@ func (c *Consumer) handleAbort(ctx context.Context, event *models.EventEnvelope)
 func (c *Consumer) handleSequencedEvent(ctx context.Context, event *models.EventEnvelope) {
 	seqID := *event.SeqID
 
+	// Child span for Redis Lua idempotency check
+	ctx, luaSpan := telemetry.Tracer.Start(ctx, "redis.check-and-set-seq", trace.WithAttributes(
+		attribute.String("plan_id", event.PlanID),
+		attribute.Int("seq_id", seqID),
+	))
 	result, err := c.redis.CheckAndSetSeq(ctx, event.PlanID, seqID)
 	if err != nil {
+		luaSpan.SetStatus(codes.Error, err.Error())
+		luaSpan.End()
 		slog.Error("redis check-and-set failed", "error", err)
 		c.dlq.Send(ctx, event, "redis check-and-set error: "+err.Error(), "REDIS_ERROR")
 		return
 	}
+	luaSpan.SetAttributes(attribute.String("result", result))
+	luaSpan.End()
 
 	switch result {
 	case "OK":
@@ -207,10 +232,16 @@ func (c *Consumer) handleSequencedEvent(ctx context.Context, event *models.Event
 	case "OUT_OF_ORDER":
 		slog.Info("out-of-order event, buffering", "plan_id", event.PlanID, "seq_id", seqID)
 		raw, _ := json.Marshal(event)
+		_, bufSpan := telemetry.Tracer.Start(ctx, "redis.buffer-event", trace.WithAttributes(
+			attribute.String("plan_id", event.PlanID),
+			attribute.Int("seq_id", seqID),
+		))
 		if err := c.redis.BufferEvent(ctx, event.PlanID, seqID, raw); err != nil {
+			bufSpan.SetStatus(codes.Error, err.Error())
 			slog.Error("buffering failed", "error", err)
 			c.dlq.Send(ctx, event, "failed to buffer: "+err.Error(), "BUFFER_ERROR")
 		}
+		bufSpan.End()
 
 	case "ABORTED":
 		slog.Info("event for aborted plan, discarding", "plan_id", event.PlanID, "seq_id", seqID)
@@ -218,20 +249,35 @@ func (c *Consumer) handleSequencedEvent(ctx context.Context, event *models.Event
 }
 
 func (c *Consumer) processAndDrain(ctx context.Context, event *models.EventEnvelope) {
-	// Process the current event
+	// Process the current event in Postgres
+	ctx, dbSpan := telemetry.Tracer.Start(ctx, "postgres.process-event", trace.WithAttributes(
+		attribute.String("order_id", event.OrderID),
+		attribute.String("event_type", event.EventType),
+	))
 	if _, err := c.repo.ProcessEvent(ctx, event); err != nil {
+		dbSpan.SetStatus(codes.Error, err.Error())
+		dbSpan.End()
 		slog.Error("db process failed", "error", err, "event_id", event.EventID)
 		c.dlq.Send(ctx, event, "db process error: "+err.Error(), "DB_ERROR")
 		return
 	}
+	dbSpan.End()
 
 	// Drain any buffered events that are now consecutive
 	nextSeq := *event.SeqID + 1
+	ctx, drainSpan := telemetry.Tracer.Start(ctx, "redis.drain-buffer", trace.WithAttributes(
+		attribute.String("plan_id", event.PlanID),
+		attribute.Int("next_seq", nextSeq),
+	))
 	buffered, err := c.redis.DrainBuffer(ctx, event.PlanID, nextSeq)
 	if err != nil {
+		drainSpan.SetStatus(codes.Error, err.Error())
+		drainSpan.End()
 		slog.Error("drain buffer failed", "error", err)
 		return
 	}
+	drainSpan.SetAttributes(attribute.Int("drained_count", len(buffered)))
+	drainSpan.End()
 
 	for _, raw := range buffered {
 		var bufferedEvent models.EventEnvelope
@@ -245,11 +291,17 @@ func (c *Consumer) processAndDrain(ctx context.Context, event *models.EventEnvel
 			c.redis.CheckAndSetSeq(ctx, bufferedEvent.PlanID, *bufferedEvent.SeqID)
 		}
 
+		_, bufDbSpan := telemetry.Tracer.Start(ctx, "postgres.process-buffered-event", trace.WithAttributes(
+			attribute.String("order_id", bufferedEvent.OrderID),
+			attribute.String("event_type", bufferedEvent.EventType),
+		))
 		if _, err := c.repo.ProcessEvent(ctx, &bufferedEvent); err != nil {
+			bufDbSpan.SetStatus(codes.Error, err.Error())
 			slog.Error("db process buffered failed", "error", err)
 			c.dlq.Send(ctx, &bufferedEvent, "db process error: "+err.Error(), "DB_ERROR")
 		} else {
 			slog.Info("buffered event processed", "plan_id", bufferedEvent.PlanID, "seq_id", *bufferedEvent.SeqID)
 		}
+		bufDbSpan.End()
 	}
 }

@@ -1,4 +1,4 @@
-.PHONY: help up down down-clean restart status logs validate wait agent-build agent-run agent-dry-run agent-abort-test
+.PHONY: help up down down-clean restart status logs validate wait agent-build agent-run agent-dry-run agent-abort-test chaos-test chaos-test-gaps chaos-test-redis chaos-test-zombie grafana-open jaeger-open
 
 help: ## Exibe esta ajuda
 	@grep -E '^[a-zA-Z_%-]+:.*?## .*$$' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-15s\033[0m %s\n", $$1, $$2}'
@@ -109,3 +109,31 @@ consul-kv-get: ## Lê config CB (ex: make consul-kv-get KEY=webhook_failure_thre
 
 consul-services: ## Lista serviços registrados no Consul
 	@curl -s http://localhost:8500/v1/agent/services | python3 -m json.tool
+
+# --- Observabilidade (Fase 5) ---
+
+grafana-open: ## Abre Grafana no navegador (localhost:3000, admin/nexus)
+	@open http://localhost:3000 2>/dev/null || xdg-open http://localhost:3000 2>/dev/null || echo "Acesse http://localhost:3000 (admin/nexus)"
+
+jaeger-open: ## Abre Jaeger UI no navegador (localhost:16686)
+	@open http://localhost:16686 2>/dev/null || xdg-open http://localhost:16686 2>/dev/null || echo "Acesse http://localhost:16686"
+
+# --- Chaos Test (Fase 5) ---
+
+CHAOS_PYTHON = .venv/bin/python3
+
+chaos-deps: ## Instala dependências do chaos test no venv local
+	@test -d .venv || python3 -m venv .venv
+	@.venv/bin/pip install -q docker psycopg2-binary confluent-kafka
+
+chaos-test: ## Roda todos os cenários de chaos test
+	@$(CHAOS_PYTHON) scripts/chaos_test.py --orders 10
+
+chaos-test-gaps: ## Roda apenas cenário de Sequence Gaps
+	@$(CHAOS_PYTHON) scripts/chaos_test.py --scenario gaps --orders 10
+
+chaos-test-redis: ## Roda apenas cenário de Redis Restart
+	@$(CHAOS_PYTHON) scripts/chaos_test.py --scenario redis --orders 10
+
+chaos-test-zombie: ## Roda apenas cenário de Zombie Events
+	@$(CHAOS_PYTHON) scripts/chaos_test.py --scenario zombie --orders 10

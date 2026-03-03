@@ -27,10 +27,19 @@ from src.models.events import generate_plan_id
 from src.planner.graph import build_graph
 from src.producer.kafka_producer import check_kafka_connectivity, create_producer, publish_plan
 
+class _TraceIDFilter(logging.Filter):
+    """Injeta trace_id do OpenTelemetry nos log records para correlação."""
+    def filter(self, record):
+        span = trace.get_current_span()
+        ctx = span.get_span_context()
+        record.otelTraceID = format(ctx.trace_id, "032x") if ctx.trace_id else "0" * 32
+        return True
+
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s [trace_id=%(otelTraceID)s]",
 )
+logging.getLogger().addFilter(_TraceIDFilter())
 logger = logging.getLogger(__name__)
 
 

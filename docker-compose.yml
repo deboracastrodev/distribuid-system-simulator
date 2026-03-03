@@ -149,7 +149,7 @@ services:
     networks:
       - nexus
 
-  # --- OBSERVABILIDADE (Opcional, mas recomendado para o futuro) ---
+  # --- OBSERVABILIDADE (Tracing + Dashboards) ---
   jaeger:
     image: jaegertracing/all-in-one:latest
     container_name: nexus-jaeger
@@ -157,5 +157,29 @@ services:
       - "16686:16686" # UI
       - "4317:4317"  # OTLP gRPC
       - "4318:4318"  # OTLP HTTP
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:16686/ || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - nexus
+
+  grafana:
+    image: grafana/grafana-oss:latest
+    container_name: nexus-grafana
+    depends_on:
+      jaeger:
+        condition: service_healthy
+    ports:
+      - "3000:3000"
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: nexus
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Editor
+    volumes:
+      - ./monitoring/grafana/provisioning:/etc/grafana/provisioning
+      - ./monitoring/grafana/dashboards:/var/lib/grafana/dashboards
     networks:
       - nexus
