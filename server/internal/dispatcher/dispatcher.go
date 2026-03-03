@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"sync"
 	"time"
 
 	"github.com/sony/gobreaker/v2"
@@ -26,8 +27,11 @@ type Dispatcher struct {
 	pollInterval time.Duration
 	retryMax     int
 	retryDelay   time.Duration
-	cb           *gobreaker.CircuitBreaker[*http.Response]
 	kvWatcher    *consulkv.KVWatcher
+
+	mu           sync.RWMutex
+	cb           *gobreaker.CircuitBreaker[*http.Response]
+	lastCBConfig consulkv.CBConfig
 }
 
 func New(repo OutboxRepository, webhookURL string, pollInterval time.Duration, retryMax int, retryDelay time.Duration, kvWatcher *consulkv.KVWatcher) *Dispatcher {
@@ -41,18 +45,36 @@ func New(repo OutboxRepository, webhookURL string, pollInterval time.Duration, r
 		kvWatcher:    kvWatcher,
 	}
 
-	d.cb = d.newCircuitBreaker()
+	d.refreshCircuitBreaker()
 
 	return d
 }
 
-func (d *Dispatcher) newCircuitBreaker() *gobreaker.CircuitBreaker[*http.Response] {
-	cfg := d.kvWatcher.Config()
+// refreshCircuitBreaker recreates the CB if immutable settings changed.
+func (d *Dispatcher) refreshCircuitBreaker() {
+	newCfg := d.kvWatcher.Config()
+
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	// Only recreate if immutable settings (MaxRequests/Timeout) changed
+	if d.cb != nil &&
+		d.lastCBConfig.SuccessThreshold == newCfg.SuccessThreshold &&
+		d.lastCBConfig.OpenDuration == newCfg.OpenDuration {
+		return
+	}
+
+	slog.Info("initializing/refreshing circuit breaker",
+		"success_threshold", newCfg.SuccessThreshold,
+		"open_duration", newCfg.OpenDuration,
+	)
+
 	settings := gobreaker.Settings{
 		Name:        "webhook-dispatcher",
-		MaxRequests: cfg.SuccessThreshold,
-		Timeout:     cfg.OpenDuration,
+		MaxRequests: newCfg.SuccessThreshold,
+		Timeout:     newCfg.OpenDuration,
 		ReadyToTrip: func(counts gobreaker.Counts) bool {
+			// FailureThreshold is truly dynamic as it's checked here
 			threshold := d.kvWatcher.Config().FailureThreshold
 			return counts.ConsecutiveFailures >= threshold
 		},
@@ -65,7 +87,14 @@ func (d *Dispatcher) newCircuitBreaker() *gobreaker.CircuitBreaker[*http.Respons
 		},
 	}
 
-	return gobreaker.NewCircuitBreaker[*http.Response](settings)
+	d.cb = gobreaker.NewCircuitBreaker[*http.Response](settings)
+	d.lastCBConfig = newCfg
+}
+
+func (d *Dispatcher) getCB() *gobreaker.CircuitBreaker[*http.Response] {
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+	return d.cb
 }
 
 // Run polls the outbox table and dispatches webhooks. Blocks until ctx is cancelled.
@@ -84,6 +113,7 @@ func (d *Dispatcher) Run(ctx context.Context) {
 			slog.Info("outbox dispatcher stopped")
 			return
 		case <-ticker.C:
+			d.refreshCircuitBreaker()
 			d.poll(ctx)
 		}
 	}
@@ -109,9 +139,10 @@ func (d *Dispatcher) poll(ctx context.Context) {
 
 func (d *Dispatcher) dispatch(ctx context.Context, entry db.OutboxEntry) error {
 	var lastErr error
+	cb := d.getCB()
 
 	for attempt := 1; attempt <= d.retryMax; attempt++ {
-		resp, err := d.cb.Execute(func() (*http.Response, error) {
+		resp, err := cb.Execute(func() (*http.Response, error) {
 			return d.doHTTP(ctx, entry)
 		})
 
@@ -123,7 +154,7 @@ func (d *Dispatcher) dispatch(ctx context.Context, entry db.OutboxEntry) error {
 				return fmt.Errorf("circuit breaker open: %w", err)
 			}
 			slog.Warn("webhook attempt failed", "attempt", attempt, "max", d.retryMax, "error", err)
-			
+
 			select {
 			case <-ctx.Done():
 				return ctx.Err()
@@ -140,7 +171,7 @@ func (d *Dispatcher) dispatch(ctx context.Context, entry db.OutboxEntry) error {
 
 		lastErr = fmt.Errorf("webhook returned status %d", resp.StatusCode)
 		slog.Warn("webhook non-2xx", "attempt", attempt, "status", resp.StatusCode)
-		
+
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
@@ -153,7 +184,7 @@ func (d *Dispatcher) dispatch(ctx context.Context, entry db.OutboxEntry) error {
 
 func (d *Dispatcher) doHTTP(ctx context.Context, entry db.OutboxEntry) (*http.Response, error) {
 	cfg := d.kvWatcher.Config()
-	
+
 	// Use a context with timeout for the individual request instead of modifying the shared client
 	reqCtx, cancel := context.WithTimeout(ctx, cfg.Timeout)
 	defer cancel()
@@ -179,3 +210,4 @@ func (d *Dispatcher) doHTTP(ctx context.Context, entry db.OutboxEntry) (*http.Re
 
 	return resp, nil
 }
+

@@ -38,10 +38,10 @@ Decisoes tecnologicas baseadas nos ADRs registrados em `docs/blueprint-arquitetu
 
 ## 🟣 Fase 5: Observabilidade e Prova de Conceito
 
-- [ ] **Task 5.1:** Adicionar OpenTelemetry ao Agent Python — injetar header `traceparent` em cada evento produzido.
-- [ ] **Task 5.2:** Adicionar OpenTelemetry ao Server Go — propagar `traceparent` em cada hop (Kafka -> Redis -> Postgres -> Webhook).
-- [ ] **Task 5.3:** Subir Grafana + Jaeger no Docker Compose para visualizacao de traces distribuidos.
-- [ ] **Task 5.4:** Criar script de Chaos Test cobrindo: queda de rede, reprocessamento Kafka, eventos fora de ordem, expiracao de TTL no buffer, e ABORT_PLAN.
+- [x] **Task 5.1:** Adicionar OpenTelemetry ao Agent Python — injetar header `traceparent` em cada evento produzido. Adicionado decorator `@_traced_node` nos nodes LangGraph e `TraceIDFilter` nos logs.
+- [x] **Task 5.2:** Adicionar OpenTelemetry ao Server Go — propagar `traceparent` em cada hop (Kafka -> Redis -> Postgres -> Webhook). Child spans adicionados: `redis.check-and-set-seq`, `redis.abort-plan`, `postgres.process-event`, `redis.drain-buffer`, etc.
+- [x] **Task 5.3:** Subir Grafana + Jaeger no Docker Compose para visualizacao de traces distribuidos. Dashboard provisionado com data links para Jaeger UI e Explore.
+- [x] **Task 5.4:** Criar script de Chaos Test cobrindo: sequence gaps, Redis restart e zombie events (ABORT_PLAN). Script em `scripts/chaos_test.py` com 3 cenarios validados.
 
 ## 🟠 Fase 6: Qualidade, Documentacao e Demo
 

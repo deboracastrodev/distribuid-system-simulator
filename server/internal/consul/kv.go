@@ -40,9 +40,10 @@ func DefaultCBConfig() CBConfig {
 
 // KVWatcher reads Circuit Breaker config from Consul KV and watches for changes.
 type KVWatcher struct {
-	client *consulapi.Client
-	mu     sync.RWMutex
-	config CBConfig
+	client    *consulapi.Client
+	mu        sync.RWMutex
+	config    CBConfig
+	lastIndex uint64
 }
 
 func NewKVWatcher(consulAddr string) (*KVWatcher, error) {
@@ -104,23 +105,41 @@ func (w *KVWatcher) SeedDefaults() {
 	}
 }
 
-// Watch polls Consul KV for config changes. Blocks until ctx is cancelled.
-func (w *KVWatcher) Watch(ctx context.Context, interval time.Duration) {
+// Watch blocks using Consul WaitIndex for instant updates. Blocks until ctx is cancelled.
+func (w *KVWatcher) Watch(ctx context.Context) {
 	if w.client == nil {
 		slog.Warn("consul KV watcher disabled (no client)")
 		return
 	}
-	slog.Info("consul KV watcher started", "interval", interval)
-	ticker := time.NewTicker(interval)
-	defer ticker.Stop()
+	slog.Info("consul KV watcher started (blocking queries)")
 
 	for {
 		select {
 		case <-ctx.Done():
 			slog.Info("consul KV watcher stopped")
 			return
-		case <-ticker.C:
-			w.reload()
+		default:
+			// Blocking query on the prefix
+			kv := w.client.KV()
+			_, meta, err := kv.List(kvPrefix, &consulapi.QueryOptions{
+				WaitIndex: w.lastIndex,
+				WaitTime:  5 * time.Minute,
+			})
+
+			if err != nil {
+				slog.Error("consul watch error, retrying in 5s", "error", err)
+				select {
+				case <-ctx.Done():
+					return
+				case <-time.After(5 * time.Second):
+					continue
+				}
+			}
+
+			if meta.LastIndex > w.lastIndex {
+				w.lastIndex = meta.LastIndex
+				w.reload()
+			}
 		}
 	}
 }
@@ -130,45 +149,53 @@ func (w *KVWatcher) reload() {
 		return
 	}
 	kv := w.client.KV()
-	newCfg := DefaultCBConfig()
 
-	// Track if we had any errors during reload
-	hasErrors := false
+	w.mu.Lock()
+	newCfg := w.config // Start with CURRENT config, not defaults
+	w.mu.Unlock()
+
+	updated := false
 
 	if v, err := w.getUint32(kv, KeyFailureThreshold); err == nil && v > 0 {
-		newCfg.FailureThreshold = v
+		if newCfg.FailureThreshold != v {
+			newCfg.FailureThreshold = v
+			updated = true
+		}
 	} else if err != nil {
-		hasErrors = true
+		slog.Warn("failed to reload FailureThreshold", "error", err)
 	}
 
 	if v, err := w.getUint32(kv, KeySuccessThreshold); err == nil && v > 0 {
-		newCfg.SuccessThreshold = v
+		if newCfg.SuccessThreshold != v {
+			newCfg.SuccessThreshold = v
+			updated = true
+		}
 	} else if err != nil {
-		hasErrors = true
+		slog.Warn("failed to reload SuccessThreshold", "error", err)
 	}
 
 	if v, err := w.getDuration(kv, KeyTimeout); err == nil && v > 0 {
-		newCfg.Timeout = v
+		if newCfg.Timeout != v {
+			newCfg.Timeout = v
+			updated = true
+		}
 	} else if err != nil {
-		hasErrors = true
+		slog.Warn("failed to reload Timeout", "error", err)
 	}
 
 	if v, err := w.getDuration(kv, KeyOpenDuration); err == nil && v > 0 {
-		newCfg.OpenDuration = v
+		if newCfg.OpenDuration != v {
+			newCfg.OpenDuration = v
+			updated = true
+		}
 	} else if err != nil {
-		hasErrors = true
+		slog.Warn("failed to reload OpenDuration", "error", err)
 	}
 
-	if hasErrors {
-		slog.Warn("partial failure reloading Consul KV config, keeping some defaults/last known")
-	}
-
-	w.mu.Lock()
-	old := w.config
-	w.config = newCfg
-	w.mu.Unlock()
-
-	if old != newCfg {
+	if updated {
+		w.mu.Lock()
+		w.config = newCfg
+		w.mu.Unlock()
 		slog.Info("CB config updated from Consul KV",
 			"failure_threshold", newCfg.FailureThreshold,
 			"success_threshold", newCfg.SuccessThreshold,
@@ -177,7 +204,6 @@ func (w *KVWatcher) reload() {
 		)
 	}
 }
-
 func (w *KVWatcher) getUint32(kv *consulapi.KV, key string) (uint32, error) {
 	pair, _, err := kv.Get(key, nil)
 	if err != nil {

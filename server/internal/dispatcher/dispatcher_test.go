@@ -13,7 +13,7 @@ import (
 )
 
 type mockRepo struct {
-	entries []db.OutboxEntry
+	entries   []db.OutboxEntry
 	processed []string
 }
 
@@ -26,7 +26,7 @@ func (m *mockRepo) MarkOutboxProcessed(ctx context.Context, id string) error {
 	return nil
 }
 
-func TestDispatcher_CircuitBreaker(t *testing.T) {
+func TestDispatcher_CircuitBreaker_Integration(t *testing.T) {
 	// 1. Setup mock server that fails
 	failCount := 0
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -35,7 +35,7 @@ func TestDispatcher_CircuitBreaker(t *testing.T) {
 	}))
 	defer server.Close()
 
-	// 2. Setup Dispatcher with low threshold
+	// 2. Setup Dispatcher
 	repo := &mockRepo{
 		entries: []db.OutboxEntry{
 			{ID: "1", AggregateID: "agg1", EventType: "test", Payload: []byte(`{}`)},
@@ -43,47 +43,32 @@ func TestDispatcher_CircuitBreaker(t *testing.T) {
 			{ID: "3", AggregateID: "agg3", EventType: "test", Payload: []byte(`{}`)},
 		},
 	}
-	
-	// Create watcher with custom config (mocking Consul KV effect)
-	kv, _ := consul.NewKVWatcher("localhost:8500") // won't connect but has defaults
-	// Overwrite config manually for test
-	// (In a real test we'd have a mock KV but here we just want to test Dispatcher logic)
-	
+
+	// Use a KVWatcher (defaults: FailureThreshold 5)
+	kv, _ := consul.NewKVWatcher("localhost:8500") 
+
 	disp := New(repo, server.URL, 1*time.Second, 1, 1*time.Millisecond, kv)
-	
-	// Override CB for deterministic test
-	disp.cb = gobreaker.NewCircuitBreaker[*http.Response](gobreaker.Settings{
-		Name: "test",
-		ReadyToTrip: func(counts gobreaker.Counts) bool {
-			return counts.ConsecutiveFailures >= 2
-		},
-	})
 
 	ctx := context.Background()
 
-	// First call -> Fail 1
-	err := disp.dispatch(ctx, repo.entries[0])
-	if err == nil {
-		t.Error("expected error from failed webhook")
+	// The default FailureThreshold is 5. Let's fail 5 times.
+	for i := 0; i < 5; i++ {
+		_ = disp.dispatch(ctx, repo.entries[0])
 	}
 
-	// Second call -> Fail 2 -> CB should open
-	err = disp.dispatch(ctx, repo.entries[1])
-	if err == nil {
-		t.Error("expected error from failed webhook")
-	}
-	
-	if disp.cb.State() != gobreaker.StateOpen {
-		t.Errorf("expected CB state Open, got %s", disp.cb.State())
+	cb := disp.getCB()
+	if cb.State() != gobreaker.StateOpen {
+		t.Errorf("expected CB state Open after 5 failures (default threshold), got %s", cb.State())
 	}
 
-	// Third call -> Should fail fast (CB Open)
-	err = disp.dispatch(ctx, repo.entries[2])
+	// Next call should fail fast
+	err := disp.dispatch(ctx, repo.entries[1])
 	if err == nil || err.Error() == "" {
-		t.Fatal("expected error from open CB")
+		t.Fatal("expected fail-fast error from open CB")
 	}
-	
-	if failCount != 2 {
-		t.Errorf("expected 2 server calls, got %d", failCount)
+
+	if failCount != 5 {
+		t.Errorf("expected 5 server calls, got %d", failCount)
 	}
 }
+

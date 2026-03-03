@@ -150,10 +150,9 @@ func main() {
 	// Consul KV config watcher (hot-reload CB settings)
 	wg.Add(1)
 	go func() {
-		defer wg.Done()
-		kvWatcher.Watch(ctx, 15*time.Second)
+	        defer wg.Done()
+	        kvWatcher.Watch(ctx)
 	}()
-
 	slog.Info("nexus-server started", "topic", cfg.KafkaTopic, "group", cfg.KafkaConsumerGroup)
 
 	// --- Graceful Shutdown ---
