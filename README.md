@@ -112,6 +112,63 @@ make demo-e2e PLANS=100
 make chaos-test
 ```
 
+## LangGraph Studio (Visualizacao do Grafo)
+
+O Agent usa LangGraph para orquestrar a geracao de eventos. Voce pode visualizar e depurar o grafo interativamente via LangGraph Studio.
+
+### Setup (uma vez)
+
+```bash
+cd agent
+python3.13 -m venv .venv
+.venv/bin/pip install ".[dev]"
+```
+
+### Rodar
+
+```bash
+make agent-studio
+# Abre http://127.0.0.1:2024 (API) e Studio UI no browser
+```
+
+### Exemplo de Input (colar no Studio)
+
+**Fluxo completo (happy path):**
+
+```json
+{
+  "order_id": "550e8400-e29b-41d4-a716-446655440000",
+  "plan_id": "plan_demo_001",
+  "user_id": "usr_debora",
+  "items": [{"product_id": "prod_abc", "quantity": 2, "unit_price": 49.90}],
+  "total_amount": 99.80,
+  "currency": "BRL",
+  "current_seq": 0,
+  "events": [],
+  "status": "idle",
+  "abort_reason": ""
+}
+```
+
+**Fluxo de abort (items vazios):**
+
+```json
+{
+  "order_id": "550e8400-e29b-41d4-a716-446655440000",
+  "plan_id": "plan_demo_002",
+  "user_id": "usr_debora",
+  "items": [],
+  "total_amount": 0,
+  "currency": "BRL",
+  "current_seq": 0,
+  "events": [],
+  "status": "idle",
+  "abort_reason": ""
+}
+```
+
+> Requer `LANGSMITH_API_KEY` no `agent/.env`. Crie uma conta gratuita em [LangSmith](https://smith.langchain.com/) e copie a API key.
+
 ## Estrutura do Projeto
 
 ```
