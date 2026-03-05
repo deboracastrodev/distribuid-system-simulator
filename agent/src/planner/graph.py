@@ -29,7 +29,7 @@ def _route_after_plan(state: PlanState) -> str:
     return "create_order_event"
 
 
-def build_graph() -> StateGraph:
+def build_graph():
     """Constroi e compila o grafo do planner."""
     graph = StateGraph(PlanState)
 
@@ -42,9 +42,13 @@ def build_graph() -> StateGraph:
     graph.add_node("create_completion_event", create_completion_event)
     graph.add_node("abort_plan", abort_plan)
 
-    # Edges
+    # Edges (paths explicitos para visualizacao no LangGraph Studio)
     graph.set_entry_point("generate_plan")
-    graph.add_conditional_edges("generate_plan", _route_after_plan)
+    graph.add_conditional_edges(
+        "generate_plan",
+        _route_after_plan,
+        {"abort_plan": "abort_plan", "create_order_event": "create_order_event"},
+    )
     graph.add_edge("create_order_event", "create_inventory_event")
     graph.add_edge("create_inventory_event", "create_payment_event")
     graph.add_edge("create_payment_event", "create_shipping_event")
@@ -53,3 +57,7 @@ def build_graph() -> StateGraph:
     graph.add_edge("abort_plan", END)
 
     return graph.compile()
+
+
+# Grafo compilado exposto como variavel para o LangGraph Studio
+graph = build_graph()

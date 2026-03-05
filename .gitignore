@@ -16,3 +16,7 @@ server/.go
 server/.go-cache
 
 *.pyc
+__pycache__/
+*.egg-info/
+agent/build/
+agent/.langgraph_api/

@@ -15,3 +15,4 @@ src/planner/nodes.py
 src/planner/state.py
 src/producer/__init__.py
 src/producer/kafka_producer.py
+tests/test_planner.py
