@@ -1,0 +1,15 @@
+Metadata-Version: 2.4
+Name: nexus-agent
+Version: 0.1.0
+Summary: Agent Planner para o Nexus Event Gateway — gera planos de eventos Exactly-Once
+Requires-Python: >=3.12
+Requires-Dist: langgraph>=0.4
+Requires-Dist: confluent-kafka>=2.6
+Requires-Dist: pydantic>=2.0
+Requires-Dist: opentelemetry-api>=1.20
+Requires-Dist: opentelemetry-sdk>=1.20
+Requires-Dist: opentelemetry-exporter-otlp-proto-grpc>=1.20
+Requires-Dist: python-dotenv>=1.0
+Provides-Extra: dev
+Requires-Dist: pytest>=8.0; extra == "dev"
+Requires-Dist: pytest-cov>=5.0; extra == "dev"

@@ -44,6 +44,9 @@ agent-dry-run: ## Gera eventos sem publicar no Kafka
 agent-order: ## Publica pedido custom (ex: make agent-order ORDER='{"user_id":"u1","items":[...],"total_amount":10}')
 	@docker compose run --rm agent python -m src.main --order '$(ORDER)'
 
+agent-test: ## Roda testes unitários do Agent Python via Docker
+	@docker compose run --rm --no-deps agent python -m pytest tests/ -v
+
 # --- Server Go ---
 
 server-build: ## Builda a imagem do server Go
@@ -58,8 +61,17 @@ server-logs: ## Segue logs do server Go
 server-restart: ## Reinicia o server Go
 	@docker compose restart server
 
-server-test: ## Roda testes unitários do Go e script Lua (requer env)
-	@cd server && go test ./... -v
+server-test: ## Roda testes unitários do Go (Lua + unit) via Docker
+	@docker run --rm -v $(PWD)/server:/app -w /app golang:1.22-alpine sh -c "go mod tidy && go test ./scripts/lua/ -v"
+
+server-test-all: ## Roda todos os testes Go via Docker
+	@docker run --rm -v $(PWD)/server:/app -w /app golang:1.22-alpine sh -c "go mod tidy && go test ./... -v"
+
+server-test-integration: ## Roda testes de integração do consumer (requer infra up)
+	@docker run --rm --network distribuid-system-simulator_nexus -v $(PWD)/server:/app -w /app \
+		-e REDIS_ADDR=nexus-redis:6379 -e REDIS_PASSWORD=nexus_pass \
+		-e POSTGRES_DSN="postgres://nexus_user:nexus_pass@nexus-postgres:5432/nexus_db?sslmode=disable" \
+		golang:1.22-alpine sh -c "go mod tidy && go test ./internal/consumer/ -v -count=1"
 
 server-lint: ## Roda o linter (golangci-lint se disponível)
 	@cd server && golangci-lint run ./... || echo "Linter not installed"
@@ -91,6 +103,9 @@ demo-full: up ## Sobe infra e executa agent para gerar fluxo completo
 	@sleep 5
 	@$(MAKE) agent-run
 	@echo "Fluxo gerado! Verifique logs com 'make server-logs' e banco com 'make db-check'"
+
+demo-e2e: ## Roda demo E2E: envia N planos e valida Exactly-Once (requer infra up)
+	@$(CHAOS_PYTHON) scripts/e2e_demo.py --plans $(or $(PLANS),10)
 
 db-check: ## Mostra estado atual dos pedidos no banco
 	@docker compose exec postgres psql -U nexus_user -d nexus_db -c "SELECT id, status, last_seq_processed, updated_at FROM orders ORDER BY updated_at DESC LIMIT 5;"
