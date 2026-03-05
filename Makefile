@@ -47,7 +47,7 @@ agent-order: ## Publica pedido custom (ex: make agent-order ORDER='{"user_id":"u
 agent-test: ## Roda testes unitários do Agent Python via Docker
 	@docker compose run --rm --no-deps agent python -m pytest tests/ -v
 
-agent-studio: ## Abre LangGraph Studio (interface visual do grafo)
+agent-studio: ## Abre LangGraph Studio (API local + docs em http://127.0.0.1:2024/docs)
 	@cd agent && .venv/bin/langgraph dev
 
 # --- Server Go ---
