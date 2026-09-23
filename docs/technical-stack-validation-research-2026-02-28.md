@@ -109,6 +109,8 @@ Para exactly-once com ordenacao por `order_id`, Kafka e a escolha mais segura:
 
 ## 4. Estado Atomico: Redis + Lua vs Alternativas
 
+> **Nota (2026-09-23):** o veredito desta secao foi revisto no ADR-004 (`docs/blueprint-arquitetura.md`). A analise mede a atomicidade dentro do Redis, mas a sequencia tambem depende do commit no Postgres, e os dois nao sao atomicos entre si. A sequencia passou para uma transacao no Postgres (Postgres Advisory Locks, coluna da tabela abaixo), e o Redis virou cache.
+
 ### Contexto do Blueprint
 O blueprint define **Redis Cluster** com **Scripts Lua** para controle de sequencia atomica e evitar race conditions.
 

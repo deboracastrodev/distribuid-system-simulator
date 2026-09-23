@@ -1,5 +1,7 @@
 # 🚀 Tech Spec: Fase 5 - Observabilidade e Prova de Conceito (Nexus Event Gateway)
 
+> **Nota (2026-09-23):** as referências a Waiting Room no Redis e ao span do `check_and_set_seq.lua` ficaram obsoletas com o ADR-004 (`docs/blueprint-arquitetura.md`). Este documento fica como registro histórico da Fase 5.
+
 Este documento detalha a implementação da stack de observabilidade distribuída e a criação de uma bateria de testes de caos para validar as garantias de **Exactly-Once** e resiliência do Nexus Event Gateway.
 
 ## 1. Objetivos (Scope)

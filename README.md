@@ -248,3 +248,4 @@ make help  # Lista todos os comandos disponiveis
 | 4 | Consul + Circuit Breaker | Completa |
 | 5 | Observabilidade + Chaos Tests | Completa |
 | 6 | Qualidade + Demo E2E | Completa |
+| 7 | Correcao das garantias (ADR-004) | Em andamento |

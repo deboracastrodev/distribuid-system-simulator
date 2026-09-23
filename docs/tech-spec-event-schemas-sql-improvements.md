@@ -12,6 +12,8 @@ code_patterns: ['envelope wrapper com headers padrao', 'plan_id + seq_id em todo
 
 # Tech-Spec: JSON Schemas de Eventos + Melhorias no init.sql
 
+> **Nota (2026-09-23):** onde este documento cita validacao de sequencia via Redis Lua e invalidacao de `plan_id` no Redis, vale o ADR-004 (`docs/blueprint-arquitetura.md`): sequencia e abort sao decididos numa transacao no Postgres. Este documento fica como registro historico.
+
 **Created:** 2026-03-01
 
 > Cobre Tasks 1.4 e 1.5 da Fase 1 do [tasks.md](../../docs/tasks.md).
