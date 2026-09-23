@@ -1,5 +1,7 @@
 # 🚀 Tech Spec: Fase 6 - Qualidade, Documentação e Demo (Nexus Event Gateway)
 
+> **Nota (2026-09-23):** os testes de `check_and_set_seq.lua` descritos aqui foram substituídos com o ADR-004 (`docs/blueprint-arquitetura.md`). Veja `docs/tasks.md`, Fase 7. Este documento fica como registro histórico da Fase 6.
+
 Este documento detalha o plano para finalizar a Fase 6 do projeto, garantindo a robustez do sistema através de testes abrangentes, documentação técnica clara e uma demonstração funcional de ponta a ponta.
 
 ## 1. Objetivos (Scope)

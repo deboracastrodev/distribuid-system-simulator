@@ -11,8 +11,8 @@ Este documento descreve a transposição do simulador para uma arquitetura de pr
 - **RF04:** Recuperação automática de estado e tratamento de eventos órfãos (DLQ).
 
 ### ⚡ Requisitos Não-Funcionais (RNF)
-- **RNF01 (Consistência):** Modelo CP (Consistência e Tolerância a Partição) via Scripts Lua e Transações ACID.
-- **RNF02 (Escalabilidade):** Suporte a 10.000 eventos/s via Kafka Partitioning e Redis Cluster Hash Tags.
+- **RNF01 (Consistência):** Modelo CP (Consistência e Tolerância a Partição) via transação ACID no Postgres, serializada por pedido (ADR-004).
+- **RNF02 (Escalabilidade):** Suporte a 10.000 eventos/s via particionamento Kafka por `order_id`; o teto passa a ser a capacidade de escrita do Postgres (ADR-004).
 - **RNF03 (Resiliência):** Transaction Outbox Pattern para sincronização entre Postgres e sistemas externos.
 - **RNF04 (Observabilidade):** Rastreamento distribuído via OpenTelemetry (Trace Context Propagation).
 
@@ -25,8 +25,8 @@ Este documento descreve a transposição do simulador para uma arquitetura de pr
 | **Agentes (Planner)** | **Python (LangGraph)** | Geração de `plan_id` e injeção de Trace Context. |
 | **Core (Server)** | **Go (Golang)** | Consumidor de alta performance com lógica de idempotência atômica. |
 | **Mensageria** | **Apache Kafka** | Transporte persistente com ordenação por chave (`order_id`). |
-| **Estado Atômico** | **Redis Cluster** | Controle de sequência via **Scripts Lua** para evitar Race Conditions. |
-| **Source of Truth** | **PostgreSQL** | Persistência ACID e implementação do **Transaction Outbox Pattern**. |
+| **Cache de Sequência** | **Redis** | Cache monotônico do progresso de cada plano (**Script Lua**). Opcional: só serve para pular trabalho. |
+| **Source of Truth** | **PostgreSQL** | Decisão de sequência, buffer de reordenação e **Transaction Outbox Pattern**, tudo na mesma transação. |
 | **Coordenação** | **Consul** | Service Discovery, Health Checks e configurações de Circuit Breaker. |
 
 ---
@@ -35,21 +35,18 @@ Este documento descreve a transposição do simulador para uma arquitetura de pr
 
 ### A. O Ciclo de Vida do Evento (Exactly-Once)
 1.  **Produtor (Agente):** Gera um `plan_id` único e anexa aos eventos `{plan_id, seq_id}`.
-2.  **Atomicidade (Redis + Lua):** O servidor Go executa um script Lua no Redis:
-    ```lua
-    -- Verifica se a seq atual é exatamente a próxima esperada
-    local last_seq = redis.call('GET', KEYS[1]) or 0
-    if tonumber(ARGV[1]) == tonumber(last_seq) + 1 then
-        redis.call('SET', KEYS[1], ARGV[1])
-        return 1 -- Prosseguir
-    end
-    return 0 -- Bloquear/Bufferizar
-    ```
-3.  **Persistência (Postgres Outbox):** O processamento do pedido e o registro da idempotência ocorrem em uma única transação SQL. Se o commit falhar, o Kafka reprocessará o evento, e o script Lua (ou a tabela de outbox) impedirá a duplicidade.
+2.  **Decisão transacional (Postgres):** O servidor Go abre uma transação e pega `pg_advisory_xact_lock` do `order_id`, o que serializa todos os escritores do pedido, inclusive antes de a linha existir. Com o estado lido (`last_seq_processed`, `status`, `plan_id`), as regras de `internal/sequencing` decidem:
+    - `APPLY` (`seq == last_seq + 1`): atualiza o pedido, grava o outbox e drena de `pending_events` os eventos consecutivos, tudo na mesma transação;
+    - `BUFFER` (gap): grava em `pending_events`;
+    - `DUPLICATE` / `DISCARD` (plano abortado): nada a gravar;
+    - `PLAN_MISMATCH` (outro plano para o mesmo pedido): DLQ.
+3.  **Commit Kafka só do que foi resolvido:** erro transitório (banco fora, timeout) é retentado no lugar com backoff, sem pular o registro. Só vai para a DLQ o que nunca vai funcionar, e o offset só é commitado depois do ack da DLQ. Reentregas são inofensivas porque a decisão do passo 2 é idempotente.
+4.  **Cache (Redis + Lua):** Depois do commit, `advance_seq.lua` avança `seq:<plan_id>`, e nunca para trás. O cache pode ficar atrás do Postgres, mas nunca à frente, e por isso só é usado para *pular* duplicatas e planos abortados. Perder o Redis não afeta a corretude.
 
 ### B. Tratamento de Caos e Falhas
-- **Waiting Room (Buffer):** Eventos fora de ordem são guardados no Redis com **TTL de 1h**. Se a sequência não completar, o evento expira e é enviado para a **DLQ (Dead Letter Queue)**.
-- **Tombstones:** O Agente pode enviar um evento de `ABORT_PLAN` que invalida o `plan_id` no Redis, limpando buffers e interrompendo execuções futuras daquele plano.
+- **Waiting Room (Buffer):** Eventos fora de ordem ficam em `pending_events` (Postgres). Um sweeper envia para a **DLQ (Dead Letter Queue)** os que esperam mais de **1h** pelo antecessor, e só os remove depois do ack da DLQ.
+- **DLQ:** Recebe só o que nunca vai funcionar (JSON malformado, envelope inválido, dado rejeitado pelo banco, plano divergente, buffer expirado). O envio espera o ack do broker, e só então o offset de origem é commitado. O producer cria o tópico `orders-dlq` sob demanda, o que exige `auto.create.topics.enable=true` no broker (ligado no compose); sem o tópico, a partição de origem fica parada em retry em vez de perder o evento.
+- **Tombstones:** `ABORT_PLAN` marca o pedido como `aborted` e descarta o buffer do plano na mesma transação. Se chega antes de qualquer evento, grava um tombstone para descartar os eventos que chegarem depois. Pedido `completed` é terminal e ignora o abort.
 - **Observabilidade:** Cada salto (Hop) do evento propaga o header `traceparent`, permitindo visualização completa no Jaeger/Grafana.
 
 ---
@@ -61,32 +58,37 @@ sequenceDiagram
     participant A as Agent (Python)
     participant K as Kafka (Topic: orders)
     participant G as Gateway (Go)
-    participant R as Redis (Lua Engine)
-    participant DB as Postgres (Outbox)
+    participant R as Redis (cache)
+    participant DB as Postgres (Source of Truth)
     participant W as Webhook (Client)
 
     A->>K: Produce Event {plan_id: 77, seq: 1} + TraceID
     K->>G: Consume Event
-    G->>R: EVAL check_and_set_seq.lua
-    R-->>G: OK (Atomicity Guaranteed)
-    
+    G->>R: Lookup(plan_id)
+    R-->>G: miss (ou prova de duplicata → pula)
+
     rect rgb(240, 240, 240)
         Note over G,DB: Transactional Boundary
-        G->>DB: Update Order Status
-        G->>DB: Insert Into Outbox (Event: Success)
+        G->>DB: advisory lock(order_id) + ler estado
+        G->>DB: Update Order + Insert Outbox + drenar pending_events
         DB-->>G: Commit OK
     end
-    
+
+    G->>R: EVAL advance_seq.lua (após o commit)
+    G->>K: CommitRecords (registro resolvido)
     G->>W: Notify Client (Async via Dispatcher)
 ```
 
 ---
 
-## 5. Próximos Passos (Roadmap de Implementação)
-1.  [ ] **Infra:** Docker Compose com Kafka (KRaft), Redis Cluster e Postgres.
-2.  [ ] **Go Core:** Implementar o Consumer com suporte a Lua Scripts e Outbox.
-3.  [ ] **Python Agent:** Implementar o Planner usando LangGraph e injeção de headers Kafka.
-4.  [ ] **Dashboard:** Configurar stack de monitoramento (Prometheus/Grafana).
+## 5. Status do Roadmap
+
+O acompanhamento detalhado fica em [`docs/tasks.md`](tasks.md).
+
+1.  [x] **Infra:** Docker Compose com Kafka (KRaft), Redis e Postgres. O Redis roda como nó único; o Redis Cluster previsto no blueprint original não foi adotado e deixou de ser requisito com o ADR-004.
+2.  [x] **Go Core:** Consumer com decisão de sequência transacional no Postgres e Outbox (ADR-004).
+3.  [x] **Python Agent:** Planner com LangGraph e injeção de headers Kafka (`traceparent`).
+4.  [ ] **Dashboard:** Grafana + Jaeger (traces) prontos. Faltam métricas: o server ainda não expõe contadores (DLQ, duplicatas, buffer, estado do circuit breaker, consumer lag) nem há Prometheus.
 
 ---
 
@@ -111,6 +113,7 @@ sequenceDiagram
 ### ADR-003: Validacao das demais stacks — mantidas conforme blueprint original
 
 - **Data:** 2026-02-28
+- **Status:** Parcialmente substituido pelo ADR-004 (papel do Redis + Lua).
 - **Contexto:** Pesquisa tecnica comparativa realizada para todas as camadas da arquitetura.
 - **Decisao:** Manter **Go**, **LangGraph**, **Kafka**, **Redis + Lua** e **PostgreSQL** conforme definidos originalmente.
 - **Razao por camada:**
@@ -120,6 +123,22 @@ sequenceDiagram
   - **Redis + Lua:** Unica opcao que combina atomicidade total, latencia sub-ms e +30% throughput vs comandos separados. Hash tags garantem co-localizacao de chaves por `order_id` no cluster.
   - **PostgreSQL:** Unico RDBMS necessario para Transaction Outbox Pattern com ACID. Sem alternativas a considerar.
 - **Referencia:** Relatorio completo em `_bmad-output/planning-artifacts/research/technical-stack-validation-research-2026-02-28.md`
+
+### ADR-004: Postgres como fonte de verdade da sequencia; Redis vira cache
+
+- **Data:** 2026-09-23
+- **Status:** Aceito. Substitui a parte "Redis + Lua" do ADR-003.
+- **Contexto:** O ADR-003 avaliou a atomicidade *dentro* do Redis, mas o risco estava *entre* Redis e Postgres. O `check_and_set_seq.lua` avancava `seq:<plan_id>` antes do commit no Postgres. Se o commit falhasse, o evento ia para a DLQ, o offset era commitado, e o evento seguinte era aceito por cima do gap: um passo do pedido se perdia sem nenhum aviso. Alem disso, o Redis rodava sem persistencia, entao um restart zerava os contadores e travava os planos em andamento ate o TTL do buffer.
+- **Decisao:**
+  - A decisao de sequencia acontece numa transacao no Postgres, serializada por `pg_advisory_xact_lock(order_id)`. O buffer de reordenacao vira a tabela `pending_events` e e drenado na mesma transacao que aplica o evento.
+  - Redis vira cache monotonico (`advance_seq.lua`): e escrito so depois do commit e usado apenas para pular duplicatas e planos abortados.
+  - O offset Kafka so e commitado para registros resolvidos; erro transitorio e retentado no lugar; a DLQ espera o ack do broker.
+- **Razao:** Uma unica fonte de verdade elimina o dual-write: qualquer falha dentro da transacao nao deixa efeito parcial. Advisory lock em vez de `SELECT ... FOR UPDATE` porque a linha do pedido pode ainda nao existir quando o primeiro evento (ou um evento fora de ordem) chega.
+- **Trade-offs:**
+  - Cada evento novo custa uma transacao com lock no Postgres (1-5 ms segundo a pesquisa), contra sub-ms no Redis. Na pratica o custo quase nao muda: o Postgres ja estava no caminho de todo evento aplicado (upsert + outbox), e o Redis so acrescentava um hop.
+  - O retry no lugar bloqueia a particao enquanto o banco estiver fora. E intencional: avancar violaria a ordem.
+  - Redis Cluster e hash tags deixam de ser requisito de corretude; a escala de escrita passa a depender do Postgres.
+- **Consequencias:** Perder o Redis, ou ele ficar fora do ar, nao afeta a corretude nem para o processamento, e o `/health` passa a depender so do Postgres. A corretude e coberta por testes de integracao contra Postgres real (schema isolado criado a partir do `init.sql`), incluindo entregas concorrentes do mesmo evento.
 
 ---
 *Nexus Event Gateway: Confiabilidade absoluta em um mundo caótico.*

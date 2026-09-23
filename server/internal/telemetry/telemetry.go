@@ -14,7 +14,9 @@ import (
 	"go.opentelemetry.io/otel/trace"
 )
 
-var Tracer trace.Tracer
+// Tracer starts as the global delegating tracer, so spans are safe no-ops when
+// Init is never called (tests) or fails.
+var Tracer trace.Tracer = otel.Tracer("nexus-server")
 
 func Init(ctx context.Context, endpoint, serviceName string) (func(context.Context) error, error) {
 	exporter, err := otlptracegrpc.New(ctx,

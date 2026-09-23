@@ -18,16 +18,16 @@ Decisoes tecnologicas baseadas nos ADRs registrados em `docs/blueprint-arquitetu
 - [x] **Task 2.1:** Configurar ambiente Python (venv/poetry) com dependencias LangGraph e kafka-python.
 - [x] **Task 2.2:** Criar Agent Planner com LangGraph para gerar sequencias de eventos com `plan_id` e `seq_id` unicos.
 - [x] **Task 2.3:** Integrar Producer Kafka no Python com ordering key (`order_id`) e injecao de headers (`traceparent`).
-- [x] **Task 2.4:** Implementar evento `ABORT_PLAN` (Tombstone) para invalidacao de planos no Redis.
+- [x] **Task 2.4:** Implementar evento `ABORT_PLAN` (Tombstone) para invalidacao de planos no Redis. *(Invalidacao movida para o Postgres na Task 7.3.)*
 
 ## 🔴 Fase 3: O Coracao de Go
 
 - [x] **Task 3.1:** Inicializar modulo Go e configurar consumidor Kafka com **franz-go** (ADR-001).
-- [x] **Task 3.2:** Desenvolver Script Lua (`check_and_set_seq.lua`) no Redis para validacao de sequencia atomica, com testes isolados do script.
-- [x] **Task 3.3:** Implementar logica de Waiting Room (buffer) no Redis para eventos fora de ordem, com TTL de 1h e encaminhamento para DLQ na expiracao. (Nota: DLQ na expiração proativa em progresso).
+- [x] **Task 3.2:** Desenvolver Script Lua (`check_and_set_seq.lua`) no Redis para validacao de sequencia atomica, com testes isolados do script. *(Substituido na Task 7.1 — ADR-004.)*
+- [x] **Task 3.3:** Implementar logica de Waiting Room (buffer) no Redis para eventos fora de ordem, com TTL de 1h e encaminhamento para DLQ na expiracao. *(Buffer movido para `pending_events` no Postgres na Task 7.1.)*
 - [x] **Task 3.4:** Implementar transacao ACID no Postgres (Update Order + Insert Outbox) em boundary transacional unico.
 - [x] **Task 3.5:** Implementar DLQ (Dead Letter Queue) para eventos orfaos e falhas de processamento (RF04).
-- [x] **Task 3.6:** Implementar handler de Tombstones — processar `ABORT_PLAN` para invalidar `plan_id` no Redis e limpar buffers.
+- [x] **Task 3.6:** Implementar handler de Tombstones — processar `ABORT_PLAN` para invalidar `plan_id` no Redis e limpar buffers. *(Refeito na Task 7.3.)*
 - [x] **Task 3.7:** Implementar Webhook/Dispatcher async para notificacao de clientes apos processamento.
 - [x] **Task 3.8:** Registrar servico Go no Consul e configurar health checks.
 
@@ -39,14 +39,25 @@ Decisoes tecnologicas baseadas nos ADRs registrados em `docs/blueprint-arquitetu
 ## 🟣 Fase 5: Observabilidade e Prova de Conceito
 
 - [x] **Task 5.1:** Adicionar OpenTelemetry ao Agent Python — injetar header `traceparent` em cada evento produzido. Adicionado decorator `@_traced_node` nos nodes LangGraph e `TraceIDFilter` nos logs.
-- [x] **Task 5.2:** Adicionar OpenTelemetry ao Server Go — propagar `traceparent` em cada hop (Kafka -> Redis -> Postgres -> Webhook). Child spans adicionados: `redis.check-and-set-seq`, `redis.abort-plan`, `postgres.process-event`, `redis.drain-buffer`, etc.
+- [x] **Task 5.2:** Adicionar OpenTelemetry ao Server Go — propagar `traceparent` em cada hop (Kafka -> Redis -> Postgres -> Webhook). Child spans adicionados: `redis.check-and-set-seq`, `redis.abort-plan`, `postgres.process-event`, `redis.drain-buffer`, etc. *(Apos a Task 7.1 os spans de sequencia sao `postgres.apply-event` e `postgres.abort-plan`.)*
 - [x] **Task 5.3:** Subir Grafana + Jaeger no Docker Compose para visualizacao de traces distribuidos. Dashboard provisionado com data links para Jaeger UI e Explore.
 - [x] **Task 5.4:** Criar script de Chaos Test cobrindo: sequence gaps, Redis restart e zombie events (ABORT_PLAN). Script em `scripts/chaos_test.py` com 3 cenarios validados.
 
 ## 🟠 Fase 6: Qualidade, Documentacao e Demo
 
-- [ ] **Task 6.1:** Criar testes unitarios para o Script Lua (`check_and_set_seq.lua`) — validar sequencia correta, duplicata, fora de ordem.
-- [ ] **Task 6.2:** Criar testes de integracao para o Consumer Go (franz-go + Redis + Postgres em containers de teste).
+- [x] **Task 6.1:** Criar testes unitarios para o Script Lua (`check_and_set_seq.lua`) — validar sequencia correta, duplicata, fora de ordem. *(O script foi substituido por `advance_seq.lua`, testado com miniredis em `server/internal/redis`; as regras de sequencia sao testadas por tabela em `server/internal/sequencing`.)*
+- [ ] **Task 6.2:** Criar testes de integracao para o Consumer Go (franz-go + Redis + Postgres em containers de teste). *(Parcial: processamento e retry cobertos contra Postgres real + miniredis em `server/internal/consumer`. Falta cobrir o loop franz-go (poll/commit) com Kafka real.)*
 - [ ] **Task 6.3:** Criar testes para o Agent Planner Python (geracao de `plan_id`/`seq_id`, producao de eventos, `ABORT_PLAN`).
 - [ ] **Task 6.4:** Criar demo end-to-end — script que executa o fluxo completo: Agent -> Kafka -> Go -> Redis -> Postgres -> Webhook, provando exactly-once em acao.
 - [ ] **Task 6.5:** Criar `README.md` com: diagrama de arquitetura, stack justificada (referenciando ADRs), instrucoes de setup (`docker-compose up`), e como rodar a demo E2E.
+
+## ⚫ Fase 7: Correcao das Garantias (ADR-004)
+
+- [x] **Task 7.1:** Mover a decisao de sequencia para uma transacao no Postgres (advisory lock por `order_id`), com o buffer de reordenacao em `pending_events` drenado na mesma transacao.
+- [x] **Task 7.2:** Commitar offsets Kafka so para registros resolvidos: retry no lugar para erro transitorio, DLQ com ack do broker para erro permanente.
+- [x] **Task 7.3:** `ABORT_PLAN` idempotente no Postgres: uma notificacao, tombstone para abort antes de qualquer evento, pedido `completed` terminal.
+- [x] **Task 7.4:** Rebaixar o Redis a cache monotonico (`advance_seq.lua`), escrito apos o commit; `/health` independente do Redis.
+- [x] **Task 7.5:** Ordem deterministica do outbox (`outbox.position`), para eventos drenados na mesma transacao.
+- [x] **Task 7.6:** Testes de integracao contra Postgres real: gap, reordenacao, abort, entregas concorrentes, expiracao do buffer, falha transitoria do banco, perda do Redis.
+- [x] **Task 7.7:** Remover a Fase 5 (reenvio de todos os eventos) do cenario Redis Restart em `scripts/chaos_test.py` e exigir que 100% dos pedidos terminem `completed` com seq 5, com exatamente uma notificacao por evento no outbox. Contra o server anterior ao ADR-004 o cenario falha (0/10 pedidos completos).
+- [x] **Task 7.8:** Criar o topico `orders-dlq` sob demanda no producer da DLQ (franz-go nao cria topicos ao produzir) e adicionar o cenario de chaos "Poison Messages": JSON malformado e eventos invalidos intercalados com planos validos devem ir para a DLQ sem travar a particao.

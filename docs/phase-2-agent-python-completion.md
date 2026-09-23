@@ -1,5 +1,7 @@
 # Documentação de Conclusão: Fase 2 - O Cérebro Agêntico (Python)
 
+> **Nota (2026-09-23):** a invalidacao de planos no Redis citada aqui passou a ser feita no Postgres (ADR-004 em `docs/blueprint-arquitetura.md`). O contrato do evento `ABORT_PLAN` nao mudou.
+
 Esta documentação detalha a implementação da Fase 2 do Nexus Event Gateway, responsável pela geração e orquestração de planos de eventos utilizando LangGraph e Python.
 
 ## 🚀 Visão Geral

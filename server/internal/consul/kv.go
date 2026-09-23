@@ -121,11 +121,17 @@ func (w *KVWatcher) Watch(ctx context.Context) {
 		default:
 			// Blocking query on the prefix
 			kv := w.client.KV()
-			_, meta, err := kv.List(kvPrefix, &consulapi.QueryOptions{
+			// The context lets shutdown interrupt the long poll.
+			opts := (&consulapi.QueryOptions{
 				WaitIndex: w.lastIndex,
 				WaitTime:  5 * time.Minute,
-			})
+			}).WithContext(ctx)
+			_, meta, err := kv.List(kvPrefix, opts)
 
+			if ctx.Err() != nil {
+				slog.Info("consul KV watcher stopped")
+				return
+			}
 			if err != nil {
 				slog.Error("consul watch error, retrying in 5s", "error", err)
 				select {

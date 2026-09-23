@@ -1,5 +1,7 @@
 # Quick Tech Spec — Fase 3: O Coração de Go (Server)
 
+> **Nota (2026-09-23):** o controle de sequência descrito aqui (Redis + `check_and_set_seq.lua`, buffer no Redis, abort no Redis) foi substituído por uma transação no Postgres. Ver ADR-004 em `docs/blueprint-arquitetura.md`. Este documento fica como registro histórico da Fase 3.
+
 ## Resumo
 Implementar o servidor de processamento de eventos em Go, responsável por consumir eventos do Kafka, validar a sequência atômica via Redis + Lua, persistir o estado no Postgres usando o Outbox Pattern e notificar clientes via Webhooks. O objetivo central é garantir a semântica **Exactly-Once**.
 

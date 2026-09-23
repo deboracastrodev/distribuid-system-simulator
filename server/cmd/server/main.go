@@ -13,8 +13,8 @@ import (
 
 	consulapi "github.com/hashicorp/consul/api"
 
-	consulkv "github.com/user/nexus-server/internal/consul"
 	"github.com/user/nexus-server/internal/config"
+	consulkv "github.com/user/nexus-server/internal/consul"
 	"github.com/user/nexus-server/internal/consumer"
 	"github.com/user/nexus-server/internal/db"
 	"github.com/user/nexus-server/internal/dispatcher"
@@ -41,17 +41,17 @@ func main() {
 		slog.Warn("OpenTelemetry init failed (non-fatal)", "error", err)
 	}
 
-	// --- Redis ---
-	redisClient, err := redisc.New(cfg.RedisAddr, cfg.RedisPassword, cfg.BufferTTL, cfg.LuaScriptPath)
+	// --- Redis (seq cache: optional, Postgres decides when it is down) ---
+	redisClient, err := redisc.New(cfg.RedisAddr, cfg.RedisPassword, cfg.LuaScriptPath)
 	if err != nil {
 		slog.Error("redis init failed", "error", err)
 		os.Exit(1)
 	}
 	if err := redisClient.Ping(ctx); err != nil {
-		slog.Error("redis ping failed", "error", err)
-		os.Exit(1)
+		slog.Warn("redis unavailable at startup, running without seq cache until it recovers", "error", err)
+	} else {
+		slog.Info("connected to Redis")
 	}
-	slog.Info("connected to Redis")
 
 	// --- Postgres ---
 	repo, err := db.New(ctx, cfg.PostgresDSN)
@@ -68,7 +68,7 @@ func main() {
 	}
 
 	// --- Kafka Consumer ---
-	cons, err := consumer.New(cfg.KafkaBrokers, cfg.KafkaTopic, cfg.KafkaConsumerGroup, redisClient, repo, dlqProducer)
+	cons, err := consumer.New(cfg.KafkaBrokers, cfg.KafkaTopic, cfg.KafkaConsumerGroup, cfg.PendingEventTTL, repo, redisClient, dlqProducer)
 	if err != nil {
 		slog.Error("kafka consumer init failed", "error", err)
 		os.Exit(1)
@@ -92,15 +92,16 @@ func main() {
 	// --- Health HTTP server ---
 	healthMux := http.NewServeMux()
 	healthMux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
-		if err := redisClient.Ping(r.Context()); err != nil {
-			http.Error(w, "redis unhealthy", http.StatusServiceUnavailable)
-			return
-		}
+		// Postgres is required to process events; the Redis cache is not.
 		if err := repo.Ping(r.Context()); err != nil {
 			http.Error(w, "postgres unhealthy", http.StatusServiceUnavailable)
 			return
 		}
 		w.WriteHeader(http.StatusOK)
+		if err := redisClient.Ping(r.Context()); err != nil {
+			fmt.Fprint(w, "OK (degraded: seq cache unavailable)")
+			return
+		}
 		fmt.Fprint(w, "OK")
 	})
 	httpServer := &http.Server{Addr: fmt.Sprintf(":%d", cfg.ServicePort), Handler: healthMux}
@@ -150,8 +151,8 @@ func main() {
 	// Consul KV config watcher (hot-reload CB settings)
 	wg.Add(1)
 	go func() {
-	        defer wg.Done()
-	        kvWatcher.Watch(ctx)
+		defer wg.Done()
+		kvWatcher.Watch(ctx)
 	}()
 	slog.Info("nexus-server started", "topic", cfg.KafkaTopic, "group", cfg.KafkaConsumerGroup)
 
@@ -167,6 +168,11 @@ func main() {
 	defer shutdownCancel()
 
 	httpServer.Shutdown(shutdownCtx)
+
+	// Let the workers finish (the consumer commits what it settled) before
+	// closing the connections they use.
+	wg.Wait()
+
 	cons.Close()
 	dlqProducer.Close()
 	redisClient.Close()
@@ -180,7 +186,6 @@ func main() {
 		shutdownTracer(shutdownCtx)
 	}
 
-	wg.Wait()
 	slog.Info("nexus-server stopped gracefully")
 }
 
