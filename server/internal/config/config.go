@@ -20,9 +20,9 @@ type Config struct {
 
 	PostgresDSN string
 
-	ConsulAddr    string
-	ServiceName   string
-	ServicePort   int
+	ConsulAddr     string
+	ServiceName    string
+	ServicePort    int
 	HealthCheckTTL time.Duration
 
 	OTELEndpoint    string
@@ -34,7 +34,9 @@ type Config struct {
 	WebhookRetryDelay  time.Duration
 	OutboxPollInterval time.Duration
 
-	BufferTTL time.Duration
+	// PendingEventTTL is how long an out-of-order event waits for its
+	// predecessor before it is sent to the DLQ.
+	PendingEventTTL time.Duration
 
 	LuaScriptPath string
 }
@@ -54,9 +56,9 @@ func Load() (*Config, error) {
 
 		PostgresDSN: envOrDefault("POSTGRES_DSN", "postgres://nexus_user:nexus_pass@postgres:5432/nexus_db?sslmode=disable"),
 
-		ConsulAddr:    envOrDefault("CONSUL_ADDR", "consul:8500"),
-		ServiceName:   envOrDefault("SERVICE_NAME", "nexus-server"),
-		ServicePort:   envOrDefaultInt("SERVICE_PORT", 8080),
+		ConsulAddr:     envOrDefault("CONSUL_ADDR", "consul:8500"),
+		ServiceName:    envOrDefault("SERVICE_NAME", "nexus-server"),
+		ServicePort:    envOrDefaultInt("SERVICE_PORT", 8080),
 		HealthCheckTTL: 30 * time.Second,
 
 		OTELEndpoint:    envOrDefault("OTEL_EXPORTER_OTLP_ENDPOINT", "jaeger:4317"),
@@ -68,9 +70,9 @@ func Load() (*Config, error) {
 		WebhookRetryDelay:  5 * time.Second,
 		OutboxPollInterval: 2 * time.Second,
 
-		BufferTTL: 1 * time.Hour,
+		PendingEventTTL: 1 * time.Hour,
 
-		LuaScriptPath: envOrDefault("LUA_SCRIPT_PATH", "/app/scripts/lua/check_and_set_seq.lua"),
+		LuaScriptPath: envOrDefault("LUA_SCRIPT_PATH", "/app/scripts/lua/advance_seq.lua"),
 	}
 
 	if err := cfg.validate(); err != nil {

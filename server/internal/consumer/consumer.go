@@ -3,6 +3,7 @@ package consumer
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"log/slog"
 	"time"
 
@@ -12,20 +13,60 @@ import (
 	"go.opentelemetry.io/otel/trace"
 
 	"github.com/user/nexus-server/internal/db"
-	"github.com/user/nexus-server/internal/dlq"
-	redisc "github.com/user/nexus-server/internal/redis"
+	"github.com/user/nexus-server/internal/sequencing"
 	"github.com/user/nexus-server/internal/telemetry"
 	"github.com/user/nexus-server/pkg/models"
 )
 
-type Consumer struct {
-	client    *kgo.Client
-	redis     *redisc.Client
-	repo      *db.Repository
-	dlq       *dlq.Producer
+const (
+	retryBaseDelay = 200 * time.Millisecond
+	retryMaxDelay  = 10 * time.Second
+
+	// cacheCooldown is how long the seq cache is bypassed after it fails, so an
+	// outage costs one timeout per window instead of one per event.
+	cacheCooldown = 5 * time.Second
+
+	pendingSweepInterval = time.Minute
+	pendingSweepBatch    = 100
+
+	commitTimeout = 5 * time.Second
+)
+
+// Store persists events and is the only source of truth for sequencing.
+type Store interface {
+	ApplyEvent(ctx context.Context, event *models.EventEnvelope) (db.Result, error)
+	AbortPlan(ctx context.Context, event *models.EventEnvelope) (db.Result, error)
+	ExpirePending(ctx context.Context, maxAge time.Duration, limit int, sink func(context.Context, *models.EventEnvelope) error) (int, error)
 }
 
-func New(brokers []string, topic, group string, redis *redisc.Client, repo *db.Repository, dlqProducer *dlq.Producer) (*Consumer, error) {
+// SeqCache is a fast path in front of Store. It may lag behind Store but never
+// runs ahead of it, so it is trusted only to skip events, never to accept them.
+type SeqCache interface {
+	Lookup(ctx context.Context, planID string) (lastSeq int, aborted bool, err error)
+	Advance(ctx context.Context, planID string, seq int) error
+	MarkAborted(ctx context.Context, planID string) error
+}
+
+// DeadLetter receives events that can never be processed. A nil error means the
+// broker acknowledged the event.
+type DeadLetter interface {
+	Send(ctx context.Context, event *models.EventEnvelope, reason, code string) error
+	SendRaw(ctx context.Context, raw []byte, reason, code string) error
+}
+
+type Consumer struct {
+	client *kgo.Client
+	store  Store
+	cache  SeqCache
+	dlq    DeadLetter
+
+	pendingTTL     time.Duration
+	retryBase      time.Duration
+	retryMax       time.Duration
+	cacheDownUntil time.Time // only touched by the Run goroutine
+}
+
+func New(brokers []string, topic, group string, pendingTTL time.Duration, store Store, cache SeqCache, dlq DeadLetter) (*Consumer, error) {
 	client, err := kgo.NewClient(
 		kgo.SeedBrokers(brokers...),
 		kgo.ConsumerGroup(group),
@@ -36,24 +77,39 @@ func New(brokers []string, topic, group string, redis *redisc.Client, repo *db.R
 		return nil, err
 	}
 
+	c := newConsumer(store, cache, dlq, pendingTTL)
+	c.client = client
+	return c, nil
+}
+
+func newConsumer(store Store, cache SeqCache, dlq DeadLetter, pendingTTL time.Duration) *Consumer {
 	return &Consumer{
-		client: client,
-		redis:  redis,
-		repo:   repo,
-		dlq:    dlqProducer,
-	}, nil
+		store:      store,
+		cache:      cache,
+		dlq:        dlq,
+		pendingTTL: pendingTTL,
+		retryBase:  retryBaseDelay,
+		retryMax:   retryMaxDelay,
+	}
 }
 
 func (c *Consumer) Close() {
 	c.client.Close()
 }
 
-// Run polls Kafka and processes records. Blocks until ctx is cancelled.
+// Run polls Kafka and processes records until ctx is cancelled. A record's
+// offset is committed only once the record is settled, so a crash or shutdown
+// replays unsettled records instead of losing them; the Store makes replays
+// harmless.
 func (c *Consumer) Run(ctx context.Context) {
 	slog.Info("kafka consumer started")
 
-	// Start background worker for expired buffers
-	go c.bufferExpirationWorker(ctx)
+	sweeperDone := make(chan struct{})
+	go func() {
+		defer close(sweeperDone)
+		c.pendingSweeper(ctx)
+	}()
+	defer func() { <-sweeperDone }()
 
 	for {
 		fetches := c.client.PollFetches(ctx)
@@ -62,75 +118,73 @@ func (c *Consumer) Run(ctx context.Context) {
 			return
 		}
 
-		if errs := fetches.Errors(); len(errs) > 0 {
-			for _, e := range errs {
-				slog.Error("kafka fetch error", "topic", e.Topic, "partition", e.Partition, "error", e.Err)
+		for _, e := range fetches.Errors() {
+			slog.Error("kafka fetch error", "topic", e.Topic, "partition", e.Partition, "error", e.Err)
+		}
+
+		var settled []*kgo.Record
+		for iter := fetches.RecordIter(); !iter.Done(); {
+			record := iter.Next()
+			if err := c.processWithRetry(ctx, record); err != nil {
+				break // shutting down: leave this record and the rest uncommitted
 			}
+			settled = append(settled, record)
 		}
+		c.commit(settled)
 
-		fetches.EachRecord(func(record *kgo.Record) {
-			c.handleRecord(ctx, record)
-		})
-
-		if err := c.client.CommitUncommittedOffsets(ctx); err != nil {
-			slog.Error("commit offsets failed", "error", err)
-		}
-	}
-}
-
-func (c *Consumer) bufferExpirationWorker(ctx context.Context) {
-	ticker := time.NewTicker(5 * time.Minute)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-ctx.Done():
+		if ctx.Err() != nil {
+			slog.Info("kafka consumer stopping")
 			return
-		case <-ticker.C:
-			c.checkExpiredBuffers(ctx)
 		}
 	}
 }
 
-func (c *Consumer) checkExpiredBuffers(ctx context.Context) {
-	keys, err := c.redis.GetBufferKeys(ctx)
-	if err != nil {
-		slog.Error("failed to scan buffer keys", "error", err)
+// commit uses its own context so work finished right before shutdown is still
+// committed.
+func (c *Consumer) commit(records []*kgo.Record) {
+	if len(records) == 0 {
 		return
 	}
-
-	for _, key := range keys {
-		// If key still exists but has no TTL (or very low), it might be a candidate.
-		// However, we set TTL on every ZAdd. If it exists, it's not expired yet.
-		// The requirement is to send to DLQ if they stay too long.
-		// A better way: if ZCard > 0 and TTL is low, or if we use a separate "last updated" field.
-		// For now, let's just drain and DLQ if the buffer is older than the TTL.
-		// Actually, Redis handles deletion. We'd need Keyspace Notifications to be perfect.
-		// As a compromise: if we find keys, we check their members.
-		// If a buffer stays there and doesn't get drained by processAndDrain, it means there's a permanent gap.
-		
-		// Logic: if the buffer exists, and it's close to expiration (e.g., < 1 min), drain to DLQ.
-		ttl, err := c.redis.TTL(ctx, key)
-		if err != nil || ttl < 0 {
-			continue
-		}
-
-		if ttl < 2*time.Minute {
-			slog.Warn("buffer close to expiration, draining to DLQ", "key", key)
-			members, _ := c.redis.GetBufferMembers(ctx, key)
-			for _, m := range members {
-				var event models.EventEnvelope
-				json.Unmarshal([]byte(m), &event)
-				c.dlq.Send(ctx, &event, "buffer timeout: consecutive event never arrived", "BUFFER_TIMEOUT")
-			}
-			c.redis.DeleteKey(ctx, key)
-		}
+	ctx, cancel := context.WithTimeout(context.Background(), commitTimeout)
+	defer cancel()
+	if err := c.client.CommitRecords(ctx, records...); err != nil {
+		// Not fatal: the records will be redelivered and deduplicated.
+		slog.Error("commit offsets failed", "error", err)
 	}
 }
 
-func (c *Consumer) handleRecord(ctx context.Context, record *kgo.Record) {
-	// Extract trace context from Kafka headers
-	headers := make(map[string]string)
+// processWithRetry retries transient failures in place. Moving past a record
+// would let a later event of the same order overtake it, and committing past
+// it would lose it. Returns an error only when ctx is cancelled.
+func (c *Consumer) processWithRetry(ctx context.Context, record *kgo.Record) error {
+	delay := c.retryBase
+	for attempt := 1; ; attempt++ {
+		err := c.handleRecord(ctx, record)
+		if err == nil {
+			return nil
+		}
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+
+		slog.Warn("transient failure, retrying record",
+			"topic", record.Topic, "partition", record.Partition, "offset", record.Offset,
+			"attempt", attempt, "retry_in", delay, "error", err,
+		)
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(delay):
+		}
+		delay = min(delay*2, c.retryMax)
+	}
+}
+
+// handleRecord processes one record. A nil error means the record is settled
+// (persisted, deliberately skipped, or acknowledged by the DLQ) and its offset
+// may be committed. A non-nil error is transient: the record must be retried.
+func (c *Consumer) handleRecord(ctx context.Context, record *kgo.Record) error {
+	headers := make(map[string]string, len(record.Headers))
 	for _, h := range record.Headers {
 		headers[h.Key] = string(h.Value)
 	}
@@ -141,10 +195,9 @@ func (c *Consumer) handleRecord(ctx context.Context, record *kgo.Record) {
 
 	var event models.EventEnvelope
 	if err := json.Unmarshal(record.Value, &event); err != nil {
+		span.SetStatus(codes.Error, "parse failure")
 		slog.Error("failed to parse event", "error", err, "offset", record.Offset)
-		span.SetAttributes(attribute.String("error", "parse_failure"))
-		c.dlq.SendRaw(ctx, record.Value, "failed to parse event JSON", "PARSE_ERROR")
-		return
+		return c.dlq.SendRaw(ctx, record.Value, "failed to parse event JSON: "+err.Error(), "PARSE_ERROR")
 	}
 
 	span.SetAttributes(
@@ -152,156 +205,178 @@ func (c *Consumer) handleRecord(ctx context.Context, record *kgo.Record) {
 		attribute.String("event.plan_id", event.PlanID),
 		attribute.String("event.order_id", event.OrderID),
 	)
-
-	// Correlate logs with trace
-	traceID := span.SpanContext().TraceID().String()
 	slog.Info("event received",
 		"type", event.EventType,
 		"plan_id", event.PlanID,
 		"order_id", event.OrderID,
 		"offset", record.Offset,
-		"trace_id", traceID,
+		"trace_id", span.SpanContext().TraceID().String(),
 	)
 
-	// Handle ABORT_PLAN tombstone
-	if event.EventType == "ABORT_PLAN" {
-		span.SetStatus(codes.Error, "plan aborted")
-		c.handleAbort(ctx, &event)
-		return
+	if err := event.Validate(); err != nil {
+		span.SetStatus(codes.Error, "invalid event")
+		return c.dlq.Send(ctx, &event, err.Error(), "INVALID_EVENT")
 	}
 
-	if event.SeqID == nil {
-		slog.Error("event missing seq_id", "event_id", event.EventID)
-		c.dlq.Send(ctx, &event, "missing seq_id for non-ABORT event", "MISSING_SEQ_ID")
-		return
+	if event.EventType == models.EventTypeAbortPlan {
+		return c.handleAbort(ctx, &event)
 	}
-
-	c.handleSequencedEvent(ctx, &event)
+	return c.handleSequenced(ctx, &event)
 }
 
-func (c *Consumer) handleAbort(ctx context.Context, event *models.EventEnvelope) {
-	// 1. Invalidate plan in Redis and clear buffer
-	ctx, redisSpan := telemetry.Tracer.Start(ctx, "redis.abort-plan", trace.WithAttributes(
-		attribute.String("plan_id", event.PlanID),
-	))
-	if err := c.redis.AbortPlan(ctx, event.PlanID); err != nil {
-		redisSpan.SetStatus(codes.Error, err.Error())
-		slog.Error("redis abort failed", "plan_id", event.PlanID, "error", err)
+func (c *Consumer) handleSequenced(ctx context.Context, event *models.EventEnvelope) error {
+	seq := *event.SeqID
+	if c.skipFromCache(ctx, event.PlanID, seq) {
+		return nil
 	}
-	redisSpan.End()
 
-	// 2. Mark order as aborted in Postgres
-	_, dbSpan := telemetry.Tracer.Start(ctx, "postgres.abort-order", trace.WithAttributes(
-		attribute.String("order_id", event.OrderID),
-	))
-	if err := c.repo.AbortOrder(ctx, event); err != nil {
-		dbSpan.SetStatus(codes.Error, err.Error())
-		slog.Error("db abort failed", "order_id", event.OrderID, "error", err)
-	}
-	dbSpan.End()
-
-	slog.Info("ABORT_PLAN processed", "plan_id", event.PlanID, "order_id", event.OrderID)
-}
-
-func (c *Consumer) handleSequencedEvent(ctx context.Context, event *models.EventEnvelope) {
-	seqID := *event.SeqID
-
-	// Child span for Redis Lua idempotency check
-	ctx, luaSpan := telemetry.Tracer.Start(ctx, "redis.check-and-set-seq", trace.WithAttributes(
-		attribute.String("plan_id", event.PlanID),
-		attribute.Int("seq_id", seqID),
-	))
-	result, err := c.redis.CheckAndSetSeq(ctx, event.PlanID, seqID)
+	res, err := c.persist(ctx, "postgres.apply-event", event, c.store.ApplyEvent)
 	if err != nil {
-		luaSpan.SetStatus(codes.Error, err.Error())
-		luaSpan.End()
-		slog.Error("redis check-and-set failed", "error", err)
-		c.dlq.Send(ctx, event, "redis check-and-set error: "+err.Error(), "REDIS_ERROR")
-		return
+		return c.handleStoreError(ctx, event, err)
 	}
-	luaSpan.SetAttributes(attribute.String("result", result))
-	luaSpan.End()
 
-	switch result {
-	case "OK":
-		c.processAndDrain(ctx, event)
-
-	case "DUPLICATE":
-		slog.Info("duplicate event ignored", "plan_id", event.PlanID, "seq_id", seqID)
-
-	case "OUT_OF_ORDER":
-		slog.Info("out-of-order event, buffering", "plan_id", event.PlanID, "seq_id", seqID)
-		raw, _ := json.Marshal(event)
-		_, bufSpan := telemetry.Tracer.Start(ctx, "redis.buffer-event", trace.WithAttributes(
-			attribute.String("plan_id", event.PlanID),
-			attribute.Int("seq_id", seqID),
-		))
-		if err := c.redis.BufferEvent(ctx, event.PlanID, seqID, raw); err != nil {
-			bufSpan.SetStatus(codes.Error, err.Error())
-			slog.Error("buffering failed", "error", err)
-			c.dlq.Send(ctx, event, "failed to buffer: "+err.Error(), "BUFFER_ERROR")
-		}
-		bufSpan.End()
-
-	case "ABORTED":
-		slog.Info("event for aborted plan, discarding", "plan_id", event.PlanID, "seq_id", seqID)
+	switch res.Outcome {
+	case sequencing.Apply:
+		slog.Info("event applied", "plan_id", event.PlanID, "seq_id", seq, "drained", res.Drained, "last_seq", res.LastSeq)
+		c.advanceCache(ctx, event.PlanID, res.LastSeq)
+	case sequencing.Duplicate:
+		slog.Info("duplicate event ignored", "plan_id", event.PlanID, "seq_id", seq)
+		c.advanceCache(ctx, event.PlanID, res.LastSeq)
+	case sequencing.Buffer:
+		slog.Info("out-of-order event buffered", "plan_id", event.PlanID, "seq_id", seq, "last_seq", res.LastSeq)
+	case sequencing.Discard:
+		slog.Info("event for aborted plan discarded", "plan_id", event.PlanID, "seq_id", seq)
+		c.markAbortedInCache(ctx, event.PlanID)
+	case sequencing.PlanMismatch:
+		return c.dlq.Send(ctx, event, "order belongs to another plan", "PLAN_MISMATCH")
 	}
+	return nil
 }
 
-func (c *Consumer) processAndDrain(ctx context.Context, event *models.EventEnvelope) {
-	// Process the current event in Postgres
-	ctx, dbSpan := telemetry.Tracer.Start(ctx, "postgres.process-event", trace.WithAttributes(
+func (c *Consumer) handleAbort(ctx context.Context, event *models.EventEnvelope) error {
+	res, err := c.persist(ctx, "postgres.abort-plan", event, c.store.AbortPlan)
+	if err != nil {
+		return c.handleStoreError(ctx, event, err)
+	}
+
+	switch res.Outcome {
+	case sequencing.Apply, sequencing.Tombstone, sequencing.Duplicate:
+		slog.Info("ABORT_PLAN processed", "plan_id", event.PlanID, "order_id", event.OrderID, "outcome", res.Outcome)
+		c.markAbortedInCache(ctx, event.PlanID)
+	case sequencing.Discard:
+		slog.Info("ABORT_PLAN ignored: order already completed", "plan_id", event.PlanID, "order_id", event.OrderID)
+	case sequencing.PlanMismatch:
+		return c.dlq.Send(ctx, event, "order belongs to another plan", "PLAN_MISMATCH")
+	}
+	return nil
+}
+
+func (c *Consumer) persist(ctx context.Context, spanName string, event *models.EventEnvelope,
+	op func(context.Context, *models.EventEnvelope) (db.Result, error),
+) (db.Result, error) {
+	ctx, span := telemetry.Tracer.Start(ctx, spanName, trace.WithAttributes(
 		attribute.String("order_id", event.OrderID),
 		attribute.String("event_type", event.EventType),
 	))
-	if _, err := c.repo.ProcessEvent(ctx, event); err != nil {
-		dbSpan.SetStatus(codes.Error, err.Error())
-		dbSpan.End()
-		slog.Error("db process failed", "error", err, "event_id", event.EventID)
-		c.dlq.Send(ctx, event, "db process error: "+err.Error(), "DB_ERROR")
-		return
-	}
-	dbSpan.End()
+	defer span.End()
 
-	// Drain any buffered events that are now consecutive
-	nextSeq := *event.SeqID + 1
-	ctx, drainSpan := telemetry.Tracer.Start(ctx, "redis.drain-buffer", trace.WithAttributes(
-		attribute.String("plan_id", event.PlanID),
-		attribute.Int("next_seq", nextSeq),
-	))
-	buffered, err := c.redis.DrainBuffer(ctx, event.PlanID, nextSeq)
+	res, err := op(ctx, event)
 	if err != nil {
-		drainSpan.SetStatus(codes.Error, err.Error())
-		drainSpan.End()
-		slog.Error("drain buffer failed", "error", err)
+		span.SetStatus(codes.Error, err.Error())
+		return res, err
+	}
+	span.SetAttributes(attribute.String("outcome", string(res.Outcome)), attribute.Int("drained", res.Drained))
+	return res, nil
+}
+
+// handleStoreError sends data the database rejects to the DLQ and reports every
+// other failure as transient.
+func (c *Consumer) handleStoreError(ctx context.Context, event *models.EventEnvelope, err error) error {
+	if db.IsPermanent(err) {
+		return c.dlq.Send(ctx, event, "rejected by database: "+err.Error(), "DB_REJECTED")
+	}
+	return fmt.Errorf("store: %w", err)
+}
+
+// skipFromCache reports whether the cache alone proves the event needs no work.
+// Any cache failure defers the decision to the Store.
+func (c *Consumer) skipFromCache(ctx context.Context, planID string, seq int) bool {
+	if !c.cacheAvailable() {
+		return false
+	}
+	lastSeq, aborted, err := c.cache.Lookup(ctx, planID)
+	if err != nil {
+		c.cacheFailed("lookup", err)
+		return false
+	}
+	if aborted {
+		slog.Info("event for aborted plan discarded (cache)", "plan_id", planID, "seq_id", seq)
+		return true
+	}
+	if seq <= lastSeq {
+		slog.Info("duplicate event ignored (cache)", "plan_id", planID, "seq_id", seq)
+		return true
+	}
+	return false
+}
+
+func (c *Consumer) advanceCache(ctx context.Context, planID string, seq int) {
+	if !c.cacheAvailable() {
 		return
 	}
-	drainSpan.SetAttributes(attribute.Int("drained_count", len(buffered)))
-	drainSpan.End()
+	if err := c.cache.Advance(ctx, planID, seq); err != nil {
+		c.cacheFailed("advance", err)
+	}
+}
 
-	for _, raw := range buffered {
-		var bufferedEvent models.EventEnvelope
-		if err := json.Unmarshal(raw, &bufferedEvent); err != nil {
-			slog.Error("failed to parse buffered event", "error", err)
-			continue
-		}
+func (c *Consumer) markAbortedInCache(ctx context.Context, planID string) {
+	if !c.cacheAvailable() {
+		return
+	}
+	if err := c.cache.MarkAborted(ctx, planID); err != nil {
+		c.cacheFailed("mark-aborted", err)
+	}
+}
 
-		// Update sequence counter in Redis
-		if bufferedEvent.SeqID != nil {
-			c.redis.CheckAndSetSeq(ctx, bufferedEvent.PlanID, *bufferedEvent.SeqID)
-		}
+func (c *Consumer) cacheAvailable() bool {
+	return c.cache != nil && time.Now().After(c.cacheDownUntil)
+}
 
-		_, bufDbSpan := telemetry.Tracer.Start(ctx, "postgres.process-buffered-event", trace.WithAttributes(
-			attribute.String("order_id", bufferedEvent.OrderID),
-			attribute.String("event_type", bufferedEvent.EventType),
-		))
-		if _, err := c.repo.ProcessEvent(ctx, &bufferedEvent); err != nil {
-			bufDbSpan.SetStatus(codes.Error, err.Error())
-			slog.Error("db process buffered failed", "error", err)
-			c.dlq.Send(ctx, &bufferedEvent, "db process error: "+err.Error(), "DB_ERROR")
-		} else {
-			slog.Info("buffered event processed", "plan_id", bufferedEvent.PlanID, "seq_id", *bufferedEvent.SeqID)
+func (c *Consumer) cacheFailed(op string, err error) {
+	c.cacheDownUntil = time.Now().Add(cacheCooldown)
+	slog.Warn("seq cache unavailable, bypassing it", "op", op, "cooldown", cacheCooldown, "error", err)
+}
+
+// pendingSweeper sends events whose predecessor never arrived to the DLQ.
+func (c *Consumer) pendingSweeper(ctx context.Context) {
+	ticker := time.NewTicker(pendingSweepInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			c.expirePending(ctx)
 		}
-		bufDbSpan.End()
+	}
+}
+
+func (c *Consumer) expirePending(ctx context.Context) {
+	sink := func(ctx context.Context, event *models.EventEnvelope) error {
+		return c.dlq.Send(ctx, event, "buffer timeout: predecessor event never arrived", "BUFFER_TIMEOUT")
+	}
+	for {
+		n, err := c.store.ExpirePending(ctx, c.pendingTTL, pendingSweepBatch, sink)
+		if err != nil {
+			slog.Error("expiring pending events failed", "error", err)
+			return
+		}
+		if n > 0 {
+			slog.Warn("expired pending events sent to DLQ", "count", n)
+		}
+		if n < pendingSweepBatch {
+			return
+		}
 	}
 }

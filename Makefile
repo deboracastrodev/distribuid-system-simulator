@@ -64,17 +64,13 @@ server-logs: ## Segue logs do server Go
 server-restart: ## Reinicia o server Go
 	@docker compose restart server
 
-server-test: ## Roda testes unitários do Go (Lua + unit) via Docker
-	@docker run --rm -v $(PWD)/server:/app -w /app golang:1.22-alpine sh -c "go mod tidy && go test ./scripts/lua/ -v"
-
-server-test-all: ## Roda todos os testes Go via Docker
+server-test: ## Roda testes unitários do Go via Docker (sem infra; integração é pulada)
 	@docker run --rm -v $(PWD)/server:/app -w /app golang:1.22-alpine sh -c "go mod tidy && go test ./... -v"
 
-server-test-integration: ## Roda testes de integração do consumer (requer infra up)
-	@docker run --rm --network distribuid-system-simulator_nexus -v $(PWD)/server:/app -w /app \
-		-e REDIS_ADDR=nexus-redis:6379 -e REDIS_PASSWORD=nexus_pass \
+server-test-integration: ## Roda todos os testes Go contra o Postgres do compose (requer infra up; usa schema isolado)
+	@docker run --rm --network distribuid-system-simulator_nexus -v $(PWD):/repo -w /repo/server \
 		-e POSTGRES_DSN="postgres://nexus_user:nexus_pass@nexus-postgres:5432/nexus_db?sslmode=disable" \
-		golang:1.22-alpine sh -c "go mod tidy && go test ./internal/consumer/ -v -count=1"
+		golang:1.22-alpine sh -c "go mod tidy && go test ./... -v -count=1"
 
 server-lint: ## Roda o linter (golangci-lint se disponível)
 	@cd server && golangci-lint run ./... || echo "Linter not installed"

@@ -202,6 +202,7 @@ def _clean_db(conn) -> None:
     """Limpa tabelas para começar teste do zero."""
     with conn.cursor() as cur:
         cur.execute("DELETE FROM outbox")
+        cur.execute("DELETE FROM pending_events")
         cur.execute("DELETE FROM orders")
     conn.commit()
     logger.info("DB limpo")
