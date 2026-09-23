@@ -45,7 +45,7 @@ func TestDispatcher_CircuitBreaker_Integration(t *testing.T) {
 	}
 
 	// Use a KVWatcher (defaults: FailureThreshold 5)
-	kv, _ := consul.NewKVWatcher("localhost:8500") 
+	kv, _ := consul.NewKVWatcher("localhost:8500")
 
 	disp := New(repo, server.URL, 1*time.Second, 1, 1*time.Millisecond, kv)
 
@@ -71,4 +71,3 @@ func TestDispatcher_CircuitBreaker_Integration(t *testing.T) {
 		t.Errorf("expected 5 server calls, got %d", failCount)
 	}
 }
-

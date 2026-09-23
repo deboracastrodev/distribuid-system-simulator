@@ -3,8 +3,8 @@
 help: ## Exibe esta ajuda
 	@grep -E '^[a-zA-Z_%-]+:.*?## .*$$' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-15s\033[0m %s\n", $$1, $$2}'
 
-up: ## Sobe todos os containers em background
-	@docker compose up -d
+up: ## Sobe todos os containers em background (reconstrói imagens alteradas)
+	@docker compose up -d --build
 
 down: ## Derruba todos os containers
 	@docker compose down
@@ -27,7 +27,7 @@ validate: ## Valida conectividade com todos os serviços
 	@bash scripts/validate-connectivity.sh
 
 wait: ## Sobe containers, espera health checks e valida
-	@docker compose up -d --wait
+	@docker compose up -d --build --wait
 	@bash scripts/validate-connectivity.sh
 
 # --- Agent Planner ---
