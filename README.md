@@ -86,6 +86,9 @@ O objetivo e *effectively-once*: cada evento altera o pedido e gera notificacao 
 | `ABORT_PLAN` antes de qualquer evento | tombstone `aborted`; eventos que chegarem depois sao descartados |
 | `ABORT_PLAN` com pedido completo | ignorado (estado terminal) |
 | Evento de outro plano para o mesmo pedido | DLQ (`PLAN_MISMATCH`) |
+| JSON malformado ou envelope invalido | DLQ (`PARSE_ERROR` / `INVALID_EVENT`), a particao segue |
+| Redis fora do ar ou sem dados | processamento segue pelo Postgres |
+| Postgres fora do ar | retry no lugar; nada e commitado nem perdido |
 
 ## Quick Start
 
@@ -128,7 +131,8 @@ make demo-e2e
 # Demo E2E com 100 planos
 make demo-e2e PLANS=100
 
-# Chaos tests (sequence gaps, Redis restart, zombie events)
+# Chaos tests: sequence gaps, Redis restart (sem reenvio), zombie events e mensagens envenenadas (DLQ)
+# Requer `make chaos-deps` e acesso ao Docker (o cenario Redis derruba o container nexus-redis)
 make chaos-test
 ```
 
@@ -248,4 +252,4 @@ make help  # Lista todos os comandos disponiveis
 | 4 | Consul + Circuit Breaker | Completa |
 | 5 | Observabilidade + Chaos Tests | Completa |
 | 6 | Qualidade + Demo E2E | Completa |
-| 7 | Correcao das garantias (ADR-004) | Em andamento |
+| 7 | Correcao das garantias (ADR-004) | Completa |

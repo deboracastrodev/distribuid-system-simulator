@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Chaos Test - Validação de Exactly-Once e resiliência do Nexus Event Gateway.
 
-Oráculo: envia N pedidos via Kafka, introduz caos (sequence gaps, Redis restart),
+Oráculo: envia N pedidos via Kafka, introduz caos (sequence gaps, Redis restart,
+mensagens envenenadas),
 e valida que o Postgres tem exatamente os registros esperados com status correto.
 
 Requisitos:
@@ -11,6 +12,7 @@ Uso:
     python scripts/chaos_test.py                  # Roda todos os cenários
     python scripts/chaos_test.py --scenario gaps  # Apenas sequence gaps
     python scripts/chaos_test.py --scenario redis # Apenas Redis restart
+    python scripts/chaos_test.py --scenario poison # Apenas mensagens envenenadas (DLQ)
     python scripts/chaos_test.py --orders 50      # 50 pedidos por cenário
 """
 
@@ -28,7 +30,7 @@ from datetime import datetime, timezone, timedelta
 
 import docker
 import psycopg2
-from confluent_kafka import Producer, KafkaException
+from confluent_kafka import Consumer, KafkaException, Producer
 
 logging.basicConfig(
     level=logging.INFO,
@@ -40,6 +42,7 @@ logger = logging.getLogger("chaos-test")
 
 KAFKA_BOOTSTRAP = os.getenv("KAFKA_BOOTSTRAP_SERVERS", "localhost:9092")
 KAFKA_TOPIC = os.getenv("KAFKA_TOPIC", "orders")
+KAFKA_DLQ_TOPIC = os.getenv("KAFKA_DLQ_TOPIC", "orders-dlq")
 POSTGRES_DSN = os.getenv(
     "POSTGRES_DSN",
     "dbname=nexus_db user=nexus_user password=nexus_pass host=localhost port=5432",
@@ -279,11 +282,32 @@ def scenario_sequence_gaps(producer: Producer, conn, num_orders: int) -> Scenari
     return ScenarioResult(name, True, f"{num_orders} orders 'completed' com seq=5")
 
 
-def scenario_redis_restart(producer: Producer, conn, num_orders: int) -> ScenarioResult:
-    """Cenário: derruba o Redis durante o processamento.
+def _wait_for_completion(conn, plans: list[Plan], timeout: int) -> int:
+    """Espera todos os planos chegarem a 'completed' com seq 5. Retorna quantos chegaram."""
+    plan_ids = [p.plan_id for p in plans]
+    deadline = time.time() + timeout
+    completed = 0
+    while time.time() < deadline:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT COUNT(*) FROM orders WHERE plan_id = ANY(%s) "
+                "AND status = 'completed' AND last_seq_processed = 5",
+                (plan_ids,),
+            )
+            completed = cur.fetchone()[0]
+        if completed == len(plans):
+            break
+        time.sleep(1)
+    return completed
 
-    Envia metade dos eventos, derruba Redis, envia o resto,
-    sobe Redis de volta. Valida consistência.
+
+def scenario_redis_restart(producer: Producer, conn, num_orders: int) -> ScenarioResult:
+    """Cenário: derruba o Redis no meio dos planos.
+
+    Envia os 2 primeiros eventos de cada plano, derruba o Redis, envia os 3
+    restantes com o Redis fora e sobe o Redis de volta. Nada é reenviado: o
+    sistema precisa terminar todos os pedidos sozinho, com cada evento
+    aplicado exatamente uma vez.
     """
     name = "Redis Restart"
     logger.info("=== Cenário: %s (%d pedidos) ===", name, num_orders)
@@ -292,13 +316,12 @@ def scenario_redis_restart(producer: Producer, conn, num_orders: int) -> Scenari
     plans = [Plan() for _ in range(num_orders)]
     docker_client = docker.from_env()
 
-    # Fase 1: enviar primeiros 2 eventos de cada plano
+    # Fase 1: primeiros 2 eventos de cada plano com o Redis de pé
     for p in plans:
-        events = [
+        _produce(producer, [
             _make_event(p.plan_id, p.order_id, EVENT_SEQUENCE[i], i + 1)
             for i in range(2)
-        ]
-        _produce(producer, events)
+        ])
 
     logger.info("Fase 1: primeiros eventos enviados, aguardando processamento (3s)...")
     time.sleep(3)
@@ -311,78 +334,60 @@ def scenario_redis_restart(producer: Producer, conn, num_orders: int) -> Scenari
     except Exception as e:
         return ScenarioResult(name, False, f"Falha ao derrubar Redis: {e}")
 
-    # Fase 3: enviar eventos restantes (vão falhar no server, ir para retry/DLQ)
-    for p in plans:
-        events = [
-            _make_event(p.plan_id, p.order_id, EVENT_SEQUENCE[i], i + 1)
-            for i in range(2, 5)
-        ]
-        _produce(producer, events)
-
-    logger.info("Fase 3: eventos enviados com Redis offline, aguardando (3s)...")
-    time.sleep(3)
-
-    # Fase 4: subir Redis de volta
+    # Fase 3: eventos restantes com o Redis fora do ar
     try:
+        for p in plans:
+            _produce(producer, [
+                _make_event(p.plan_id, p.order_id, EVENT_SEQUENCE[i], i + 1)
+                for i in range(2, 5)
+            ])
+        logger.info("Fase 3: eventos enviados com Redis offline, aguardando (3s)...")
+        time.sleep(3)
+    finally:
+        # Fase 4: subir Redis de volta mesmo se a fase 3 falhar
         redis_container.start()
-        logger.info("Redis reiniciado, aguardando recovery (5s)...")
-        time.sleep(5)
-    except Exception as e:
-        return ScenarioResult(name, False, f"Falha ao reiniciar Redis: {e}")
+        logger.info("Redis reiniciado")
 
-    # Fase 5: reenviar eventos que possivelmente falharam (idempotência garante no-dups)
-    for p in plans:
-        events = [
-            _make_event(p.plan_id, p.order_id, EVENT_SEQUENCE[i], i + 1)
-            for i in range(5)
-        ]
-        _produce(producer, events)
+    completed = _wait_for_completion(conn, plans, timeout=45)
 
-    logger.info("Fase 5: reenvio completo, aguardando convergência...")
-
-    if not _wait_for_processing(conn, num_orders, timeout=45):
-        # Pode não completar todos se o server não reconectou ao Redis a tempo
-        pass
-
-    time.sleep(5)
-
-    # Validação: todos devem existir no DB, verificar consistência
     with conn.cursor() as cur:
+        # Cada evento deve gerar exatamente uma notificação no outbox
         cur.execute(
-            "SELECT COUNT(*) FROM orders WHERE plan_id = ANY(%s)",
-            ([p.plan_id for p in plans],),
-        )
-        total = cur.fetchone()[0]
-
-        cur.execute(
-            "SELECT COUNT(*) FROM orders WHERE plan_id = ANY(%s) AND last_seq_processed >= 2",
-            ([p.plan_id for p in plans],),
-        )
-        processed = cur.fetchone()[0]
-
-        # Verificar duplicatas (não deve haver)
-        cur.execute(
-            """SELECT plan_id, COUNT(*) as c FROM orders
-               WHERE plan_id = ANY(%s) GROUP BY plan_id HAVING COUNT(*) > 1""",
+            """SELECT o.aggregate_id, o.event_type, COUNT(*) FROM outbox o
+               JOIN orders ord ON ord.id = o.aggregate_id
+               WHERE ord.plan_id = ANY(%s)
+               GROUP BY o.aggregate_id, o.event_type HAVING COUNT(*) > 1""",
             ([p.plan_id for p in plans],),
         )
         duplicates = cur.fetchall()
 
+        cur.execute(
+            """SELECT COUNT(*) FROM outbox o JOIN orders ord ON ord.id = o.aggregate_id
+               WHERE ord.plan_id = ANY(%s)""",
+            ([p.plan_id for p in plans],),
+        )
+        notifications = cur.fetchone()[0]
+
     if duplicates:
         return ScenarioResult(
             name, False,
-            f"DUPLICATAS encontradas! {len(duplicates)} plan_ids com múltiplas rows"
+            f"DUPLICATAS no outbox: {len(duplicates)} eventos notificados mais de uma vez. Ex: {duplicates[:3]}"
         )
-
-    if total < num_orders:
+    if completed != num_orders:
         return ScenarioResult(
             name, False,
-            f"Apenas {total}/{num_orders} orders no DB (Redis outage pode ter causado perda)"
+            f"Apenas {completed}/{num_orders} pedidos 'completed' com seq=5 (sem reenvio)"
+        )
+    if notifications != num_orders * len(EVENT_SEQUENCE):
+        return ScenarioResult(
+            name, False,
+            f"{notifications} notificações no outbox, esperado {num_orders * len(EVENT_SEQUENCE)}"
         )
 
     return ScenarioResult(
         name, True,
-        f"{total} orders no DB, {processed} com seq>=2, 0 duplicatas. Consistência OK"
+        f"{num_orders} pedidos 'completed' com seq=5 sem reenvio, "
+        f"{notifications} notificações, 0 duplicatas"
     )
 
 
@@ -444,6 +449,82 @@ def scenario_zombie_events(producer: Producer, conn, num_orders: int) -> Scenari
     return ScenarioResult(name, True, f"{num_orders} orders abortados, 0 zombies processados")
 
 
+def _count_dlq_markers(marker: str, timeout: int = 20) -> int:
+    """Conta mensagens na DLQ cujo payload contém marker."""
+    consumer = Consumer({
+        "bootstrap.servers": KAFKA_BOOTSTRAP,
+        "group.id": f"chaos-dlq-reader-{uuid.uuid4().hex[:8]}",
+        "auto.offset.reset": "earliest",
+        "enable.auto.commit": False,
+    })
+    consumer.subscribe([KAFKA_DLQ_TOPIC])
+    found = 0
+    deadline = time.time() + timeout
+    idle_since = None
+    try:
+        while time.time() < deadline:
+            msg = consumer.poll(1.0)
+            if msg is None:
+                # Depois de achar algo, 3s sem mensagens novas = fim do tópico
+                if found and idle_since and time.time() - idle_since > 3:
+                    break
+                idle_since = idle_since or time.time()
+                continue
+            idle_since = None
+            if msg.error() is None and marker.encode() in msg.value():
+                found += 1
+    finally:
+        consumer.close()
+    return found
+
+
+def scenario_poison_messages(producer: Producer, conn, num_orders: int) -> ScenarioResult:
+    """Cenário: mensagens que nunca podem ser processadas no meio de planos válidos.
+
+    Envia JSON malformado e eventos sem seq_id intercalados com planos
+    completos. As mensagens envenenadas devem ir para a DLQ sem travar a
+    partição, e todos os planos válidos devem terminar.
+    """
+    name = "Poison Messages"
+    logger.info("=== Cenário: %s (%d pedidos) ===", name, num_orders)
+
+    _clean_db(conn)
+    marker = f"chaos-poison-{uuid.uuid4().hex[:12]}"
+    plans = [Plan() for _ in range(num_orders)]
+
+    for i, p in enumerate(plans):
+        # Mesmo order_id do plano válido: cai na mesma partição e seria
+        # bloqueado se a mensagem envenenada travasse o consumer.
+        producer.produce(KAFKA_TOPIC, key=p.order_id, value=f'{{"broken": "{marker}"'.encode())
+        invalid = _make_event(f"{marker}-{i}", p.order_id, "OrderCreated", 1)
+        del invalid["seq_id"]
+        producer.produce(KAFKA_TOPIC, key=p.order_id, value=json.dumps(invalid).encode())
+        _produce(producer, [
+            _make_event(p.plan_id, p.order_id, evt, seq)
+            for seq, evt in enumerate(EVENT_SEQUENCE, start=1)
+        ])
+
+    completed = _wait_for_completion(conn, plans, timeout=45)
+    if completed != num_orders:
+        return ScenarioResult(
+            name, False,
+            f"Apenas {completed}/{num_orders} planos válidos 'completed' (partição travada?)"
+        )
+
+    expected_dlq = num_orders * 2
+    in_dlq = _count_dlq_markers(marker)
+    if in_dlq != expected_dlq:
+        return ScenarioResult(
+            name, False,
+            f"{in_dlq} mensagens envenenadas na DLQ, esperado {expected_dlq}"
+        )
+
+    return ScenarioResult(
+        name, True,
+        f"{num_orders} planos válidos 'completed', {in_dlq} mensagens envenenadas na DLQ"
+    )
+
+
 # --- Main ---
 
 
@@ -451,7 +532,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Nexus Chaos Test Suite")
     parser.add_argument(
         "--scenario",
-        choices=["gaps", "redis", "zombie", "all"],
+        choices=["gaps", "redis", "zombie", "poison", "all"],
         default="all",
         help="Cenário a executar (default: all)",
     )
@@ -488,6 +569,7 @@ def main() -> None:
         "gaps": scenario_sequence_gaps,
         "redis": scenario_redis_restart,
         "zombie": scenario_zombie_events,
+        "poison": scenario_poison_messages,
     }
 
     to_run = list(scenarios.keys()) if args.scenario == "all" else [args.scenario]

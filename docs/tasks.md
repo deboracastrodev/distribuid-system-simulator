@@ -59,4 +59,5 @@ Decisoes tecnologicas baseadas nos ADRs registrados em `docs/blueprint-arquitetu
 - [x] **Task 7.4:** Rebaixar o Redis a cache monotonico (`advance_seq.lua`), escrito apos o commit; `/health` independente do Redis.
 - [x] **Task 7.5:** Ordem deterministica do outbox (`outbox.position`), para eventos drenados na mesma transacao.
 - [x] **Task 7.6:** Testes de integracao contra Postgres real: gap, reordenacao, abort, entregas concorrentes, expiracao do buffer, falha transitoria do banco, perda do Redis.
-- [ ] **Task 7.7:** Remover a Fase 5 (reenvio de todos os eventos) do cenario Redis Restart em `scripts/chaos_test.py` e exigir que 100% dos pedidos terminem `completed` com seq 5.
+- [x] **Task 7.7:** Remover a Fase 5 (reenvio de todos os eventos) do cenario Redis Restart em `scripts/chaos_test.py` e exigir que 100% dos pedidos terminem `completed` com seq 5, com exatamente uma notificacao por evento no outbox. Contra o server anterior ao ADR-004 o cenario falha (0/10 pedidos completos).
+- [x] **Task 7.8:** Criar o topico `orders-dlq` sob demanda no producer da DLQ (franz-go nao cria topicos ao produzir) e adicionar o cenario de chaos "Poison Messages": JSON malformado e eventos invalidos intercalados com planos validos devem ir para a DLQ sem travar a particao.

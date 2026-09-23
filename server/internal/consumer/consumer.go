@@ -169,7 +169,7 @@ func (c *Consumer) processWithRetry(ctx context.Context, record *kgo.Record) err
 
 		slog.Warn("transient failure, retrying record",
 			"topic", record.Topic, "partition", record.Partition, "offset", record.Offset,
-			"attempt", attempt, "retry_in", delay, "error", err,
+			"attempt", attempt, "retry_in", delay.String(), "error", err,
 		)
 		select {
 		case <-ctx.Done():

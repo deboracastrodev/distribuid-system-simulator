@@ -45,6 +45,7 @@ Este documento descreve a transposição do simulador para uma arquitetura de pr
 
 ### B. Tratamento de Caos e Falhas
 - **Waiting Room (Buffer):** Eventos fora de ordem ficam em `pending_events` (Postgres). Um sweeper envia para a **DLQ (Dead Letter Queue)** os que esperam mais de **1h** pelo antecessor, e só os remove depois do ack da DLQ.
+- **DLQ:** Recebe só o que nunca vai funcionar (JSON malformado, envelope inválido, dado rejeitado pelo banco, plano divergente, buffer expirado). O envio espera o ack do broker, e só então o offset de origem é commitado. O producer cria o tópico `orders-dlq` sob demanda, o que exige `auto.create.topics.enable=true` no broker (ligado no compose); sem o tópico, a partição de origem fica parada em retry em vez de perder o evento.
 - **Tombstones:** `ABORT_PLAN` marca o pedido como `aborted` e descarta o buffer do plano na mesma transação. Se chega antes de qualquer evento, grava um tombstone para descartar os eventos que chegarem depois. Pedido `completed` é terminal e ignora o abort.
 - **Observabilidade:** Cada salto (Hop) do evento propaga o header `traceparent`, permitindo visualização completa no Jaeger/Grafana.
 
@@ -80,11 +81,14 @@ sequenceDiagram
 
 ---
 
-## 5. Próximos Passos (Roadmap de Implementação)
-1.  [ ] **Infra:** Docker Compose com Kafka (KRaft), Redis Cluster e Postgres.
-2.  [ ] **Go Core:** Implementar o Consumer com suporte a Lua Scripts e Outbox.
-3.  [ ] **Python Agent:** Implementar o Planner usando LangGraph e injeção de headers Kafka.
-4.  [ ] **Dashboard:** Configurar stack de monitoramento (Prometheus/Grafana).
+## 5. Status do Roadmap
+
+O acompanhamento detalhado fica em [`docs/tasks.md`](tasks.md).
+
+1.  [x] **Infra:** Docker Compose com Kafka (KRaft), Redis e Postgres. O Redis roda como nó único; o Redis Cluster previsto no blueprint original não foi adotado e deixou de ser requisito com o ADR-004.
+2.  [x] **Go Core:** Consumer com decisão de sequência transacional no Postgres e Outbox (ADR-004).
+3.  [x] **Python Agent:** Planner com LangGraph e injeção de headers Kafka (`traceparent`).
+4.  [ ] **Dashboard:** Grafana + Jaeger (traces) prontos. Faltam métricas: o server ainda não expõe contadores (DLQ, duplicatas, buffer, estado do circuit breaker, consumer lag) nem há Prometheus.
 
 ---
 

@@ -25,6 +25,11 @@ func New(brokers []string, topic string) (*Producer, error) {
 	client, err := kgo.NewClient(
 		kgo.SeedBrokers(brokers...),
 		kgo.DefaultProduceTopic(topic),
+		// Nothing else creates the DLQ topic, and franz-go does not create
+		// topics on produce unless asked. Without this, the first dead letter
+		// fails with UNKNOWN_TOPIC_OR_PARTITION and, since sends must be
+		// acknowledged, blocks the source partition.
+		kgo.AllowAutoTopicCreation(),
 		// Surface an unreachable broker as an error the consumer can retry and
 		// log, instead of blocking the send until shutdown.
 		kgo.RecordDeliveryTimeout(10*time.Second),
