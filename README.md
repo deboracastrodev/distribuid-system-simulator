@@ -120,7 +120,7 @@ O workflow `.github/workflows/ci.yml` roda em todo push, em qualquer branch:
 
 | Job | O que verifica |
 |---|---|
-| **Server (Go)** | `gofmt`, `go mod tidy` sem diff, `go vet` e `go test -race` com um Postgres 16 real (os testes de integracao rodam, nao sao pulados) |
+| **Server (Go)** | `gofmt`, `go mod tidy` sem diff, `go vet` e `go test -race` com um Postgres 16 real; com `REQUIRE_INTEGRATION=1`, um teste de integracao sem banco falha em vez de ser pulado |
 | **Agent (Python)** | `pytest` do Agent Planner |
 | **E2E + Chaos** | sobe a stack com `docker compose`, roda o e2e (50 planos) e os 4 cenarios de chaos; so roda se os dois jobs acima passarem |
 

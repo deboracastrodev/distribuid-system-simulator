@@ -64,7 +64,7 @@ Decisoes tecnologicas baseadas nos ADRs registrados em `docs/blueprint-arquitetu
 
 ## ⚪ Fase 8: Integracao Continua
 
-- [x] **Task 8.1:** Workflow `.github/workflows/ci.yml` em todo push: Go (`gofmt`, `go mod tidy` sem diff, `go vet`, `go test -race` com Postgres 16 como service container), Agent (`pytest`) e E2E + Chaos com `docker compose` (e2e com 50 planos e os 4 cenarios de chaos).
+- [x] **Task 8.1:** Workflow `.github/workflows/ci.yml` em todo push: Go (`gofmt`, `go mod tidy` sem diff, `go vet`, `go test -race` com Postgres 16 como service container e `REQUIRE_INTEGRATION=1`, que faz um teste de integracao sem banco falhar em vez de ser pulado), Agent (`pytest`) e E2E + Chaos com `docker compose` (e2e com 50 planos e os 4 cenarios de chaos).
 - [x] **Task 8.2:** `.gitignore` passa a versionar `.github/workflows/` (o resto de `.github/` segue ignorado por guardar arquivos locais de ferramentas de agente).
 - [x] **Task 8.3:** `make up` e `make wait` reconstroem imagens alteradas (`--build`); antes, subiam a imagem antiga do server depois de um `git pull`.
 - [x] **Task 8.4:** Higiene exigida pelo CI: `gofmt` no dispatcher e remocao de artefatos versionados (`agent/nexus_agent.egg-info/`, `package-lock.json` vazio).

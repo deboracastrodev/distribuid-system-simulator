@@ -37,12 +37,14 @@ jobs:
           --health-timeout 3s
           --health-retries 10
     env:
-      # Com POSTGRES_DSN definido os testes de integração rodam em vez de serem pulados.
       POSTGRES_DSN: postgres://nexus_user:nexus_pass@localhost:5432/nexus_db?sslmode=disable
+      # Sem POSTGRES_DSN os testes de integração seriam pulados e o job passaria
+      # sem testar nada; com esta variável eles falham em vez de pular.
+      REQUIRE_INTEGRATION: "1"
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@v7
         with:
           go-version-file: server/go.mod
           cache-dependency-path: server/go.sum
@@ -75,9 +77,9 @@ jobs:
       run:
         working-directory: agent
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
           cache: pip
@@ -95,9 +97,9 @@ jobs:
     needs: [server, agent]
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
 
