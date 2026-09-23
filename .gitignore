@@ -5,7 +5,9 @@ _bmad/
 .venv/
 steps.md
 _bmad-output/
-.github/
+# .github/ guarda arquivos locais de ferramentas de agente; só os workflows de CI são versionados
+.github/*
+!.github/workflows/
 .env
 server/.env
 

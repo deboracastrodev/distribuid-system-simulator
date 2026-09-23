@@ -1,5 +1,7 @@
 # Nexus Event Gateway
 
+[![CI](https://github.com/deboracastrodev/distribuid-system-simulator/actions/workflows/ci.yml/badge.svg)](https://github.com/deboracastrodev/distribuid-system-simulator/actions/workflows/ci.yml)
+
 Simulador de sistema distribuido com garantias **Exactly-Once** para processamento de eventos de pedidos.
 
 ## Arquitetura
@@ -111,6 +113,20 @@ make jaeger-open    # http://localhost:16686
 ```
 
 ## Testes
+
+### Integracao Continua
+
+O workflow `.github/workflows/ci.yml` roda em todo push, em qualquer branch:
+
+| Job | O que verifica |
+|---|---|
+| **Server (Go)** | `gofmt`, `go mod tidy` sem diff, `go vet` e `go test -race` com um Postgres 16 real; com `REQUIRE_INTEGRATION=1`, um teste de integracao sem banco falha em vez de ser pulado |
+| **Agent (Python)** | `pytest` do Agent Planner |
+| **E2E + Chaos** | sobe a stack com `docker compose`, roda o e2e (50 planos) e os 4 cenarios de chaos; so roda se os dois jobs acima passarem |
+
+Um PR so deve ser aberto com o CI verde no ultimo commit.
+
+### Localmente
 
 ```bash
 # Testes Go sem infra (integracao e pulada)
@@ -253,3 +269,4 @@ make help  # Lista todos os comandos disponiveis
 | 5 | Observabilidade + Chaos Tests | Completa |
 | 6 | Qualidade + Demo E2E | Completa |
 | 7 | Correcao das garantias (ADR-004) | Completa |
+| 8 | Integracao continua (GitHub Actions) | Completa |

@@ -210,4 +210,3 @@ func (d *Dispatcher) doHTTP(ctx context.Context, entry db.OutboxEntry) (*http.Re
 
 	return resp, nil
 }
-

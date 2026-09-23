@@ -17,11 +17,15 @@ import (
 
 // DSN creates a fresh schema with the project schema applied and returns a DSN
 // whose connections use it. The schema is dropped when the test ends. Skips
-// the test when POSTGRES_DSN is not set.
+// the test when POSTGRES_DSN is not set, unless REQUIRE_INTEGRATION is set:
+// CI sets it so a missing DSN fails the build instead of passing silently.
 func DSN(t *testing.T) string {
 	t.Helper()
 	base := os.Getenv("POSTGRES_DSN")
 	if base == "" {
+		if os.Getenv("REQUIRE_INTEGRATION") != "" {
+			t.Fatal("REQUIRE_INTEGRATION is set but POSTGRES_DSN is empty")
+		}
 		t.Skip("integration test: POSTGRES_DSN not set")
 	}
 
