@@ -22,6 +22,7 @@ from src.models.events import (
     OrderShippedData,
     PaymentProcessedData,
 )
+from src.planner.simulation import INVENTORY_STEP, PAYMENT_STEP, fails
 from src.planner.state import PlanState
 
 _tracer = trace.get_tracer(__name__)
@@ -90,7 +91,9 @@ def create_order_event(state: PlanState) -> dict:
 
 @_traced_node
 def create_inventory_event(state: PlanState) -> dict:
-    """Gera evento InventoryValidated (seq 2)."""
+    """Gera evento InventoryValidated (seq 2), ou aborta se o estoque falhar."""
+    if fails(state.get("simulation"), INVENTORY_STEP, "inventory_failure_rate"):
+        return {"status": "aborted", "abort_reason": "inventory_failed"}
     seq = state["current_seq"] + 1
     reserved_until = (datetime.now(timezone.utc) + timedelta(hours=1)).isoformat()
     data = InventoryValidatedData(
@@ -107,7 +110,13 @@ def create_inventory_event(state: PlanState) -> dict:
 
 @_traced_node
 def create_payment_event(state: PlanState) -> dict:
-    """Gera evento PaymentProcessed (seq 3)."""
+    """Gera evento PaymentProcessed (seq 3), ou aborta se o pagamento for recusado.
+
+    Um pagamento recusado não gera PaymentProcessed: o server marcaria o
+    pedido como payment_processed. O plano termina com ABORT_PLAN.
+    """
+    if fails(state.get("simulation"), PAYMENT_STEP, "payment_rejection_rate"):
+        return {"status": "aborted", "abort_reason": "payment_rejected"}
     seq = state["current_seq"] + 1
     data = PaymentProcessedData(
         payment_id=f"pay_{uuid.uuid4().hex[:8]}",
@@ -168,7 +177,7 @@ def abort_plan(state: PlanState) -> dict:
         "payment_rejected": "payment_rejected",
     }
     data = AbortPlanData(
-        reason=f"Validacao do plano falhou: {reason}",
+        reason=f"Plano abortado: {reason}",
         abort_code=code_map.get(reason, "manual"),
         aborted_at_seq=state["current_seq"],
     )

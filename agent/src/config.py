@@ -15,6 +15,11 @@ OTEL_SERVICE_NAME = os.getenv("OTEL_SERVICE_NAME", "nexus-agent")
 # Limite de valor maximo por pedido (regra de negocio)
 ORDER_MAX_AMOUNT = float(os.getenv("ORDER_MAX_AMOUNT", "100000.00"))
 
+# Simulacao (defaults das flags da CLI). Zero = caminho feliz, sem atraso.
+SIM_INVENTORY_FAILURE_RATE = float(os.getenv("SIM_INVENTORY_FAILURE_RATE", "0"))
+SIM_PAYMENT_REJECTION_RATE = float(os.getenv("SIM_PAYMENT_REJECTION_RATE", "0"))
+SIM_STEP_DELAY_MS = int(os.getenv("SIM_STEP_DELAY_MS", "0"))
+
 
 def validate_config() -> None:
     """Valida variaveis criticas no startup. Falha fast se invalido."""

@@ -112,6 +112,15 @@ jobs:
       - name: E2E (50 planos)
         run: python scripts/e2e_demo.py --plans 50
 
+      # O agent real (imagem do compose) com falhas simuladas: cada plano tem de
+      # terminar no Postgres e no webhook sink como o agent relatou.
+      - name: Agent com falhas simuladas (40 planos)
+        run: |
+          docker compose run --rm -v "$PWD:/out" agent python -m src.main \
+            --orders 40 --inventory-failure-rate 0.2 --payment-rejection-rate 0.25 \
+            --seed ci --report /out/agent-report.json
+          python scripts/check_agent_outcomes.py agent-report.json
+
       - name: Chaos (gaps, Redis restart, zombies, mensagens envenenadas, webhooks)
         run: python scripts/chaos_test.py --orders 10
 

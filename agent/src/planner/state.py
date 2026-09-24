@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import TypedDict
+from typing import NotRequired, TypedDict
 
 
 class PlanState(TypedDict):
@@ -16,3 +16,4 @@ class PlanState(TypedDict):
     events: list[dict]      # Eventos gerados (buffer antes de publish)
     status: str             # "planning" | "publishing" | "done" | "aborted"
     abort_reason: str       # Motivo do abort (vazio se nao abortado)
+    simulation: NotRequired[dict]  # Falhas simuladas (Simulation.as_state); ausente = caminho feliz

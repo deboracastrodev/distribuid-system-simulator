@@ -83,3 +83,12 @@ Decisoes tecnologicas baseadas nos ADRs registrados em `docs/blueprint-arquitetu
 - [x] **Task 10.3:** Dispatcher: resultado das entregas, latencia do webhook e estado do circuit breaker. Backlog do outbox e do buffer lido do Postgres no scrape.
 - [x] **Task 10.4:** Prometheus 3.13 no compose, datasource e dashboard "Nexus Event Gateway - Metricas" provisionados no Grafana.
 - [x] **Task 10.5:** `scripts/check_metrics.py` no CI: metricas coerentes com o e2e e o chaos, scrape do Prometheus, todas as queries do dashboard com dados, e dashboard e datasource provisionados no Grafana.
+
+## 🔶 Fase 11: Agent com Falhas Simuladas
+
+- [x] **Task 11.1:** Falhas de estoque e de pagamento com taxas configuraveis (`--inventory-failure-rate`, `--payment-rejection-rate`, env `SIM_*`). A decisao e um hash de (seed, passo), sem RNG no state; cada plano de uma execucao recebe a seed `<seed>:<posicao>`, entao `--seed` reproduz a execucao inteira. Os codigos `inventory_failed` e `payment_rejected`, antes nunca emitidos, passam a ser exercitados.
+- [x] **Task 11.2:** O grafo desvia para `abort_plan` depois de estoque ou pagamento; um pagamento recusado nao gera `PaymentProcessed`.
+- [x] **Task 11.3:** Publicacao passo a passo (`graph.stream`) com atraso opcional entre eventos (`--step-delay-ms`) e ack do broker por evento: falha de entrega interrompe o agent com codigo 1 em vez de ser so logada.
+- [x] **Task 11.4:** Gerador de carga (`--orders N`) com relatorio JSON por plano (`--report`).
+- [x] **Task 11.5:** `scripts/check_agent_outcomes.py` no CI: 40 planos do agent (imagem do compose) conferidos no Postgres, no outbox e no webhook sink.
+- [x] **Task 11.6:** Logs do agent: o filtro que injeta `trace_id` estava no logger raiz, que nao filtra records de loggers filhos; toda linha de log falhava com `KeyError: 'otelTraceID'`. O filtro passou para o handler.

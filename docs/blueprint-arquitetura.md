@@ -88,7 +88,7 @@ O acompanhamento detalhado fica em [`docs/tasks.md`](tasks.md).
 
 1.  [x] **Infra:** Docker Compose com Kafka (KRaft), Redis e Postgres. O Redis roda como nó único; o Redis Cluster previsto no blueprint original não foi adotado e deixou de ser requisito com o ADR-004.
 2.  [x] **Go Core:** Consumer com decisão de sequência transacional no Postgres e Outbox (ADR-004).
-3.  [x] **Python Agent:** Planner com LangGraph e injeção de headers Kafka (`traceparent`).
+3.  [x] **Python Agent:** Planner com LangGraph e injeção de headers Kafka (`traceparent`). Publica cada evento assim que o node o gera, com ack do broker, e simula falhas de estoque e pagamento (reproduzíveis por seed) que terminam em `ABORT_PLAN`.
 4.  [x] **Dashboard:** Grafana com traces (Jaeger) e métricas (Prometheus): desfechos do sequenciamento, DLQ, buffer, consumer lag, entregas de webhook, circuit breaker e backlog do outbox (ADR-006).
 
 ---

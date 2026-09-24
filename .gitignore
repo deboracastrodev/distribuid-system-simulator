@@ -22,3 +22,6 @@ __pycache__/
 *.egg-info/
 agent/build/
 agent/.langgraph_api/
+
+# Relatório do agent (make agent-simulate)
+agent-report.json
