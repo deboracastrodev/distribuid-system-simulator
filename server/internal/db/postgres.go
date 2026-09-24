@@ -190,6 +190,15 @@ func (r *Repository) ExpirePending(ctx context.Context, maxAge time.Duration, li
 	return expired, nil
 }
 
+// PendingEventsCount counts out-of-order events waiting for their predecessor.
+func (r *Repository) PendingEventsCount(ctx context.Context) (int64, error) {
+	var n int64
+	if err := r.pool.QueryRow(ctx, `SELECT COUNT(*) FROM pending_events`).Scan(&n); err != nil {
+		return 0, fmt.Errorf("count pending events: %w", err)
+	}
+	return n, nil
+}
+
 type pendingRow struct {
 	OrderID string
 	PlanID  string

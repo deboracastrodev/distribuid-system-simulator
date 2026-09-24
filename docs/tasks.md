@@ -75,3 +75,11 @@ Decisoes tecnologicas baseadas nos ADRs registrados em `docs/blueprint-arquitetu
 - [x] **Task 9.2:** Cenario de chaos "Webhook Delivery" (503 a cada 3 requisicoes e um pedido rejeitado com 400). Falha na versao anterior do dispatcher: sem `Idempotency-Key`, 4xx retentado e ordem `[2, 3, 4, 5, 1]`.
 - [x] **Task 9.3:** Dispatcher reescrito: so a cabeca de cada pedido e elegivel (ordem por pedido), `FOR UPDATE SKIP LOCKED` + lease, retry agendado no banco com backoff, 4xx em dead-letter imediato, `Idempotency-Key`, entrega paralela entre pedidos (`WEBHOOK_WORKERS`, antes ignorado).
 - [x] **Task 9.4:** Testes de integracao do dispatcher contra Postgres real: ordem, isolamento entre pedidos, dead-letter por 4xx e por tentativas, lease expirado, circuito aberto, shutdown e duas instancias concorrentes.
+
+## 🔘 Fase 10: Metricas (ADR-006)
+
+- [x] **Task 10.1:** Pacote `internal/metrics` com `prometheus/client_golang` e registry injetado; `/metrics` na porta 8080.
+- [x] **Task 10.2:** Consumer: desfechos do sequenciamento, eventos drenados, DLQ por codigo (so apos ack), retries, tempo ate resolver, consumer lag e falhas do cache.
+- [x] **Task 10.3:** Dispatcher: resultado das entregas, latencia do webhook e estado do circuit breaker. Backlog do outbox e do buffer lido do Postgres no scrape.
+- [x] **Task 10.4:** Prometheus 3.13 no compose, datasource e dashboard "Nexus Event Gateway - Metricas" provisionados no Grafana.
+- [x] **Task 10.5:** `scripts/check_metrics.py` no CI: metricas coerentes com o e2e e o chaos, scrape do Prometheus, todas as queries do dashboard com dados, e dashboard e datasource provisionados no Grafana.

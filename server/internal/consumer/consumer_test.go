@@ -9,11 +9,14 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/prometheus/client_golang/prometheus/testutil"
+	dto "github.com/prometheus/client_model/go"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"github.com/twmb/franz-go/pkg/kgo"
 
 	"github.com/user/nexus-server/internal/db"
+	"github.com/user/nexus-server/internal/metrics"
 	"github.com/user/nexus-server/internal/sequencing"
 	"github.com/user/nexus-server/pkg/models"
 )
@@ -135,13 +138,21 @@ func applied(lastSeq int) func(*models.EventEnvelope) (db.Result, error) {
 }
 
 func newTestConsumer(store Store, cache SeqCache, dlq DeadLetter) *Consumer {
-	c := newConsumer(store, cache, dlq, time.Hour)
+	c := newConsumer(store, cache, dlq, time.Hour, metrics.NewForTest())
 	c.retryBase = time.Millisecond
 	c.retryMax = 5 * time.Millisecond
 	return c
 }
 
 var errConnReset = errors.New("connection reset by peer")
+
+func events(c *Consumer, kind, outcome string) float64 {
+	return testutil.ToFloat64(c.metrics.EventsProcessed.WithLabelValues(kind, outcome))
+}
+
+func dlqCount(c *Consumer, code string) float64 {
+	return testutil.ToFloat64(c.metrics.DLQMessages.WithLabelValues(code))
+}
 
 // --- settling rules: nil error = offset may be committed ---
 
@@ -155,6 +166,7 @@ func TestHandleRecord_TransientStoreErrorIsNotSettled(t *testing.T) {
 	assert.ErrorIs(t, err, errConnReset)
 	assert.Empty(t, dlq.codes, "a transient failure is retried, not dead-lettered")
 	assert.Empty(t, cache.advanced, "the cache must never run ahead of Postgres")
+	assert.Zero(t, events(c, "sequenced", "apply"), "an unsettled event is not counted")
 }
 
 func TestHandleRecord_PermanentStoreErrorGoesToDLQ(t *testing.T) {
@@ -166,6 +178,7 @@ func TestHandleRecord_PermanentStoreErrorGoesToDLQ(t *testing.T) {
 
 	require.NoError(t, c.handleRecord(context.Background(), newPlan().record(t, 1)))
 	assert.Equal(t, []string{"DB_REJECTED"}, dlq.codes)
+	assert.Equal(t, float64(1), dlqCount(c, "DB_REJECTED"))
 }
 
 func TestHandleRecord_UnacknowledgedDLQSendIsNotSettled(t *testing.T) {
@@ -175,6 +188,7 @@ func TestHandleRecord_UnacknowledgedDLQSendIsNotSettled(t *testing.T) {
 	err := c.handleRecord(context.Background(), &kgo.Record{Value: []byte("{not json")})
 
 	assert.Error(t, err, "committing past an event the DLQ did not accept would lose it")
+	assert.Zero(t, dlqCount(c, "PARSE_ERROR"), "only acknowledged dead letters are counted")
 }
 
 func TestHandleRecord_UnprocessableEventsGoToDLQ(t *testing.T) {
@@ -195,6 +209,7 @@ func TestHandleRecord_UnprocessableEventsGoToDLQ(t *testing.T) {
 
 			require.NoError(t, c.handleRecord(context.Background(), tt.record))
 			assert.Equal(t, []string{tt.code}, dlq.codes)
+			assert.Equal(t, float64(1), dlqCount(c, tt.code))
 			assert.Zero(t, store.applied)
 		})
 	}
@@ -209,6 +224,8 @@ func TestHandleRecord_PlanMismatchGoesToDLQ(t *testing.T) {
 
 	require.NoError(t, c.handleRecord(context.Background(), newPlan().record(t, 2)))
 	assert.Equal(t, []string{"PLAN_MISMATCH"}, dlq.codes)
+	assert.Equal(t, float64(1), dlqCount(c, "PLAN_MISMATCH"))
+	assert.Equal(t, float64(1), events(c, "sequenced", "plan_mismatch"))
 }
 
 // --- cache: trusted only to skip work ---
@@ -222,6 +239,8 @@ func TestHandleRecord_CacheAdvancesToLastSeqAfterCommit(t *testing.T) {
 
 	require.NoError(t, c.handleRecord(context.Background(), newPlan().record(t, 2)))
 	assert.Equal(t, []int{4}, cache.advanced, "drained events count too")
+	assert.Equal(t, float64(1), events(c, "sequenced", "apply"))
+	assert.Equal(t, float64(2), testutil.ToFloat64(c.metrics.EventsDrained))
 }
 
 func TestHandleRecord_BufferedEventDoesNotAdvanceCache(t *testing.T) {
@@ -237,11 +256,12 @@ func TestHandleRecord_BufferedEventDoesNotAdvanceCache(t *testing.T) {
 
 func TestHandleRecord_CacheHitSkipsStore(t *testing.T) {
 	tests := []struct {
-		name  string
-		cache *fakeCache
+		name    string
+		cache   *fakeCache
+		outcome string
 	}{
-		{"already committed", &fakeCache{lastSeq: 3}},
-		{"plan aborted", &fakeCache{aborted: true}},
+		{"already committed", &fakeCache{lastSeq: 3}, "cache_duplicate"},
+		{"plan aborted", &fakeCache{aborted: true}, "cache_aborted"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -250,6 +270,7 @@ func TestHandleRecord_CacheHitSkipsStore(t *testing.T) {
 
 			require.NoError(t, c.handleRecord(context.Background(), newPlan().record(t, 2)))
 			assert.Zero(t, store.applied)
+			assert.Equal(t, float64(1), events(c, "sequenced", tt.outcome))
 		})
 	}
 }
@@ -273,6 +294,7 @@ func TestHandleRecord_CacheOutageFallsBackToStoreAndBacksOff(t *testing.T) {
 
 	assert.Equal(t, 2, store.applied, "events keep flowing without the cache")
 	assert.Equal(t, 1, cache.lookups, "the cache is bypassed during the cooldown")
+	assert.Equal(t, float64(1), testutil.ToFloat64(c.metrics.SeqCacheErrors.WithLabelValues("lookup")))
 }
 
 func TestHandleRecord_AbortMarksCache(t *testing.T) {
@@ -305,6 +327,11 @@ func TestProcessWithRetry_RetriesTransientFailureInPlace(t *testing.T) {
 	require.NoError(t, c.processWithRetry(context.Background(), newPlan().record(t, 1)))
 	assert.Equal(t, 3, store.applied)
 	assert.Empty(t, dlq.codes)
+	assert.Equal(t, float64(2), testutil.ToFloat64(c.metrics.ConsumerRetries))
+	assert.Equal(t, float64(1), events(c, "sequenced", "apply"), "counted once, not per attempt")
+	var h dto.Metric
+	require.NoError(t, c.metrics.EventSettleSeconds.Write(&h))
+	assert.Equal(t, uint64(1), h.GetHistogram().GetSampleCount())
 }
 
 func TestProcessWithRetry_StopsWhenContextIsCancelled(t *testing.T) {

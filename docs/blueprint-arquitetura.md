@@ -14,7 +14,7 @@ Este documento descreve a transposição do simulador para uma arquitetura de pr
 - **RNF01 (Consistência):** Modelo CP (Consistência e Tolerância a Partição) via transação ACID no Postgres, serializada por pedido (ADR-004).
 - **RNF02 (Escalabilidade):** Suporte a 10.000 eventos/s via particionamento Kafka por `order_id`; o teto passa a ser a capacidade de escrita do Postgres (ADR-004).
 - **RNF03 (Resiliência):** Transaction Outbox Pattern para sincronização entre Postgres e sistemas externos.
-- **RNF04 (Observabilidade):** Rastreamento distribuído via OpenTelemetry (Trace Context Propagation).
+- **RNF04 (Observabilidade):** Rastreamento distribuído via OpenTelemetry (Trace Context Propagation) e métricas Prometheus com dashboard no Grafana (ADR-006).
 
 ---
 
@@ -89,7 +89,7 @@ O acompanhamento detalhado fica em [`docs/tasks.md`](tasks.md).
 1.  [x] **Infra:** Docker Compose com Kafka (KRaft), Redis e Postgres. O Redis roda como nó único; o Redis Cluster previsto no blueprint original não foi adotado e deixou de ser requisito com o ADR-004.
 2.  [x] **Go Core:** Consumer com decisão de sequência transacional no Postgres e Outbox (ADR-004).
 3.  [x] **Python Agent:** Planner com LangGraph e injeção de headers Kafka (`traceparent`).
-4.  [ ] **Dashboard:** Grafana + Jaeger (traces) prontos. Faltam métricas: o server ainda não expõe contadores (DLQ, duplicatas, buffer, estado do circuit breaker, consumer lag) nem há Prometheus.
+4.  [x] **Dashboard:** Grafana com traces (Jaeger) e métricas (Prometheus): desfechos do sequenciamento, DLQ, buffer, consumer lag, entregas de webhook, circuit breaker e backlog do outbox (ADR-006).
 
 ---
 
@@ -158,5 +158,23 @@ O acompanhamento detalhado fica em [`docs/tasks.md`](tasks.md).
   - **Dead-letter não bloqueia o pedido:** depois que uma notificação vai para dead-letter, as seguintes do mesmo pedido são entregues. Bloquear o pedido para sempre por causa de uma notificação recusada seria pior para o receptor do que um buraco explícito, registrado no outbox (`dead_at`, `last_error`) e reprocessável. É a única situação em que a ordem por pedido não é garantida.
   - A entrega de um pedido é sequencial: com N notificações, são N idas ao banco e N requisições em série. O dispatcher volta a consultar o outbox logo após uma entrega, sem esperar o intervalo de poll, para que isso não custe N intervalos.
 - **Consequencias:** O compose ganha o `webhook-sink` (receptor de teste com falhas injetáveis), e o chaos test ganha o cenário "Webhook Delivery". Esse cenário falha na versão anterior do dispatcher (entregas sem `Idempotency-Key`, 4xx retentado, ordem `[2, 3, 4, 5, 1]`) e passa nesta. Os testes de integração do dispatcher rodam contra Postgres real e cobrem ordem, isolamento entre pedidos, dead-letter, lease expirado, circuito aberto, shutdown e duas instâncias concorrentes.
+
+### ADR-006: Metricas com o client Prometheus, nao com OpenTelemetry
+
+- **Data:** 2026-09-24
+- **Status:** Aceito.
+- **Contexto:** O server não expunha nenhuma métrica. O Grafana só tinha o Jaeger como datasource, e os sinais que importam para um sistema cujo produto são garantias não existiam: desfechos do sequenciamento, DLQ, buffer de reordenação, consumer lag, entregas de webhook e estado do circuit breaker.
+- **Decisao:**
+  - Usar `prometheus/client_golang` (v1.22, a última compatível com o `go 1.22` do projeto) e expor `/metrics` na porta 8080, junto do `/health`.
+  - As métricas ficam num `*metrics.Metrics` injetado nos componentes, com registry próprio, e não em variáveis globais: cada teste verifica contadores num registry isolado.
+  - Contar só o que foi resolvido: um evento é contado depois de resolvido, e um envio para a DLQ depois do ack do broker. Retry não conta duas vezes.
+  - O backlog (outbox pendente e dead, buffer de reordenação) é lido do Postgres no momento do scrape, e não mantido em memória: é estado no banco, compartilhado entre instâncias e persistente entre restarts.
+  - O consumer lag vem do high watermark que o próprio fetch do franz-go já traz, sem um cliente admin a mais.
+- **Razao:** O OpenTelemetry já é usado para tracing, e o SDK de métricas dele com um exporter Prometheus unificaria a instrumentação. Mas acrescentaria mais dependências e uma camada de indireção para chegar ao mesmo formato de exposição. O client Prometheus é o padrão de fato, tem testutil e lint de nomes, e o resultado é o que o Grafana consome.
+- **Trade-offs:**
+  - São duas pilhas de telemetria: traces via OpenTelemetry e métricas via Prometheus. Não há exemplars ligando uma métrica a um trace.
+  - O lag é medido depois de cada lote processado. Com o consumer parado (por exemplo, em retry no lugar), o valor não é atualizado; o sinal de travamento nesse caso é `nexus_consumer_retries_total` subindo.
+  - Contagens lidas do banco custam duas consultas por scrape (a cada 5s), com timeout de 2s.
+- **Consequencias:** Prometheus 3.13 (versão fixada) no compose, datasource e dashboard provisionados no Grafana. O CI roda `scripts/check_metrics.py` depois do chaos test. O script verifica valores coerentes com os cenários, o scrape do Prometheus, cada query do dashboard retornando dados, e o dashboard e o datasource provisionados no Grafana. Uma query quebrada no dashboard derruba o CI.
 ---
 *Nexus Event Gateway: Confiabilidade absoluta em um mundo caótico.*

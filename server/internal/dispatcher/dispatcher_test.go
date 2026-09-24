@@ -12,11 +12,14 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/prometheus/client_golang/prometheus/testutil"
+	dto "github.com/prometheus/client_model/go"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	consulkv "github.com/user/nexus-server/internal/consul"
 	"github.com/user/nexus-server/internal/db"
+	"github.com/user/nexus-server/internal/metrics"
 	"github.com/user/nexus-server/internal/testutil/pgtest"
 )
 
@@ -101,6 +104,17 @@ func (r *receiver) keys(status func(request) bool) []string {
 }
 
 func always(status int) func(request) int { return func(request) int { return status } }
+
+// results reads the webhook delivery counters of d.
+func results(d *Dispatcher) map[string]float64 {
+	out := map[string]float64{}
+	for _, r := range []string{"delivered", "retry_scheduled", "dead_max_attempts", "dead_rejected", "released"} {
+		if v := testutil.ToFloat64(d.metrics.WebhookDeliveries.WithLabelValues(r)); v > 0 {
+			out[r] = v
+		}
+	}
+	return out
+}
 
 type env struct {
 	repo *db.Repository
@@ -189,7 +203,7 @@ func TestRequestCarriesIdempotencyKeyAndPosition(t *testing.T) {
 	e := newEnv(t)
 	rcv, url := newReceiver(t, always(200))
 	agg, ids := e.seed(t, 1)
-	d := New(e.repo, testConfig(url), defaultCB())
+	d := New(e.repo, testConfig(url), defaultCB(), metrics.NewForTest())
 
 	delivered, err := d.dispatchBatch(context.Background())
 	require.NoError(t, err)
@@ -202,6 +216,8 @@ func TestRequestCarriesIdempotencyKeyAndPosition(t *testing.T) {
 	assert.Positive(t, reqs[0].position)
 	assert.Equal(t, 1, reqs[0].attempt)
 	assert.Equal(t, outboxRow{processed: true, attempts: 1}, e.row(t, ids[0]))
+	assert.Equal(t, map[string]float64{"delivered": 1}, results(d))
+	assert.Equal(t, uint64(1), histogramCount(t, d), "request duration observed")
 }
 
 // Regression: a failed entry used to be skipped while the entries after it
@@ -217,7 +233,7 @@ func TestFailedEntryHoldsBackOnlyItsSuccessors(t *testing.T) {
 		}
 		return 200
 	})
-	d := New(e.repo, testConfig(url), defaultCB())
+	d := New(e.repo, testConfig(url), defaultCB(), metrics.NewForTest())
 
 	_, err := d.dispatchBatch(context.Background())
 	require.NoError(t, err)
@@ -243,7 +259,7 @@ func TestFailingOrderDoesNotBlockOthers(t *testing.T) {
 		}
 		return 200
 	})
-	d := New(e.repo, testConfig(url), staticCB{FailureThreshold: 1000, SuccessThreshold: 1, Timeout: time.Second, OpenDuration: time.Minute})
+	d := New(e.repo, testConfig(url), staticCB{FailureThreshold: 1000, SuccessThreshold: 1, Timeout: time.Second, OpenDuration: time.Minute}, metrics.NewForTest())
 
 	dispatchUntil(t, d, func() bool {
 		for _, id := range healthyIDs {
@@ -272,7 +288,7 @@ func TestRejectedEntryIsDeadLetteredWithoutRetry(t *testing.T) {
 		}
 		return 200
 	})
-	d := New(e.repo, testConfig(url), defaultCB())
+	d := New(e.repo, testConfig(url), defaultCB(), metrics.NewForTest())
 
 	dispatchUntil(t, d, func() bool { return e.row(t, ids[1]).processed })
 
@@ -282,6 +298,7 @@ func TestRejectedEntryIsDeadLetteredWithoutRetry(t *testing.T) {
 	assert.Contains(t, rejected.lastError, "400")
 	assert.Equal(t, []string{ids[0], ids[1]}, rcv.keys(func(request) bool { return true }),
 		"one attempt for the rejected entry; the next one is then delivered")
+	assert.Equal(t, map[string]float64{"dead_rejected": 1, "delivered": 1}, results(d))
 }
 
 func TestRetryableFailureIsDeadLetteredAfterMaxAttempts(t *testing.T) {
@@ -290,12 +307,13 @@ func TestRetryableFailureIsDeadLetteredAfterMaxAttempts(t *testing.T) {
 	rcv, url := newReceiver(t, always(503))
 	cfg := testConfig(url)
 	cfg.MaxAttempts = 3
-	d := New(e.repo, cfg, defaultCB())
+	d := New(e.repo, cfg, defaultCB(), metrics.NewForTest())
 
 	dispatchUntil(t, d, func() bool { return e.row(t, ids[0]).dead })
 
 	assert.Len(t, rcv.all(), 3)
 	assert.Equal(t, 3, e.row(t, ids[0]).attempts)
+	assert.Equal(t, map[string]float64{"retry_scheduled": 2, "dead_max_attempts": 1}, results(d))
 }
 
 func TestConcurrentDispatchersDeliverEachEntryOnceInOrder(t *testing.T) {
@@ -308,7 +326,7 @@ func TestConcurrentDispatchersDeliverEachEntryOnceInOrder(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	var wg sync.WaitGroup
 	for i := 0; i < 2; i++ {
-		d := New(e.repo, testConfig(url), defaultCB())
+		d := New(e.repo, testConfig(url), defaultCB(), metrics.NewForTest())
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
@@ -336,7 +354,7 @@ func TestExpiredLeaseIsClaimedAgain(t *testing.T) {
 	e := newEnv(t)
 	_, ids := e.seed(t, 1)
 	rcv, url := newReceiver(t, always(200))
-	d := New(e.repo, testConfig(url), defaultCB())
+	d := New(e.repo, testConfig(url), defaultCB(), metrics.NewForTest())
 
 	// A dispatcher claims the entry and dies before delivering it.
 	claimed, err := e.repo.ClaimOutbox(context.Background(), 10, 200*time.Millisecond)
@@ -359,7 +377,7 @@ func TestOpenCircuitLeavesEntriesUntouched(t *testing.T) {
 	rcv, url := newReceiver(t, always(503))
 	cfg := testConfig(url)
 	cfg.Workers = 1
-	d := New(e.repo, cfg, staticCB{FailureThreshold: 1, SuccessThreshold: 1, Timeout: time.Second, OpenDuration: time.Minute})
+	d := New(e.repo, cfg, staticCB{FailureThreshold: 1, SuccessThreshold: 1, Timeout: time.Second, OpenDuration: time.Minute}, metrics.NewForTest())
 
 	_, err := d.dispatchBatch(context.Background()) // one failure opens the circuit
 	require.NoError(t, err)
@@ -370,6 +388,9 @@ func TestOpenCircuitLeavesEntriesUntouched(t *testing.T) {
 	a, b := e.row(t, first[0]), e.row(t, second[0])
 	assert.Equal(t, 1, a.attempts+b.attempts, "only the request actually sent counts as an attempt")
 	assert.False(t, a.leased || b.leased, "the entry skipped by the open circuit was released")
+	assert.Equal(t, map[string]float64{"retry_scheduled": 1, "released": 1}, results(d))
+	assert.Equal(t, float64(metrics.CBOpen), testutil.ToFloat64(d.metrics.CircuitBreakerState))
+	assert.Equal(t, float64(1), testutil.ToFloat64(d.metrics.CircuitBreakerTransitions.WithLabelValues("open")))
 }
 
 // cancelAfterResponse cancels the dispatch context once the response has
@@ -389,7 +410,7 @@ func TestDeliveryCompletedDuringShutdownIsRecorded(t *testing.T) {
 	e := newEnv(t)
 	_, ids := e.seed(t, 1)
 	rcv, url := newReceiver(t, always(200))
-	d := New(e.repo, testConfig(url), defaultCB())
+	d := New(e.repo, testConfig(url), defaultCB(), metrics.NewForTest())
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -411,7 +432,7 @@ func TestShutdownReleasesInFlightEntry(t *testing.T) {
 		time.Sleep(300 * time.Millisecond)
 		return 200
 	})
-	d := New(e.repo, testConfig(url), defaultCB())
+	d := New(e.repo, testConfig(url), defaultCB(), metrics.NewForTest())
 
 	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
 	defer cancel()
@@ -420,4 +441,12 @@ func TestShutdownReleasesInFlightEntry(t *testing.T) {
 
 	r := e.row(t, ids[0])
 	assert.Equal(t, outboxRow{}, r, "not delivered, no attempt counted, lease released")
+	assert.Equal(t, map[string]float64{"released": 1}, results(d))
+}
+
+func histogramCount(t *testing.T, d *Dispatcher) uint64 {
+	t.Helper()
+	var m dto.Metric
+	require.NoError(t, d.metrics.WebhookRequestSeconds.Write(&m))
+	return m.GetHistogram().GetSampleCount()
 }
