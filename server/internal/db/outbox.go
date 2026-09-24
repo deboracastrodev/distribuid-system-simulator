@@ -103,3 +103,18 @@ func (r *Repository) ReleaseOutbox(ctx context.Context, id string) error {
 	}
 	return nil
 }
+
+// OutboxBacklog counts notifications not yet delivered: pending (waiting for
+// delivery or a retry) and dead-lettered.
+func (r *Repository) OutboxBacklog(ctx context.Context) (pending, dead int64, err error) {
+	err = r.pool.QueryRow(ctx, `
+		SELECT COUNT(*) FILTER (WHERE dead_at IS NULL),
+		       COUNT(*) FILTER (WHERE dead_at IS NOT NULL)
+		FROM outbox
+		WHERE processed = FALSE
+	`).Scan(&pending, &dead)
+	if err != nil {
+		return 0, 0, fmt.Errorf("outbox backlog: %w", err)
+	}
+	return pending, dead, nil
+}

@@ -15,7 +15,8 @@ graph LR
     B -->|Webhooks do outbox| W[Webhook Sink<br/>receptor de teste]
     F[Consul] -.->|Service Discovery<br/>Circuit Breaker| B
     G[Jaeger] -.->|Traces OTLP| A & B
-    H[Grafana] -.->|Dashboards| G
+    P[Prometheus] -.->|scrape /metrics| B
+    H[Grafana] -.->|Dashboards| G & P
 ```
 
 ### Fluxo de um Pedido
@@ -71,6 +72,7 @@ sequenceDiagram
 | **Kafka** | Apache Kafka 3.7 | Transporte com manual commit |
 | **Jaeger** | OTLP gRPC | Distributed tracing |
 | **Grafana** | Dashboards | Metricas e visualizacao de traces |
+| **Prometheus** | Prometheus 3.13 | Scrape de `/metrics` do server a cada 5s |
 | **Webhook Sink** | Python (stdlib) | Receptor de webhooks para testes: registra entregas, verifica ordem, duplicatas e `Idempotency-Key`, e injeta falhas |
 
 ## Garantias de Processamento
@@ -109,6 +111,28 @@ A entrega e *at-least-once*: se o dispatcher morrer entre a resposta HTTP e o re
 
 Detalhes e trade-offs no ADR-005 (`docs/blueprint-arquitetura.md`).
 
+## Metricas
+
+O server expoe `/metrics` na porta 8080. O Prometheus faz scrape a cada 5s, e o dashboard **Nexus Event Gateway - Metricas** (pasta Nexus no Grafana) mostra tudo abaixo.
+
+| Metrica | Tipo | O que mede |
+|---|---|---|
+| `nexus_events_processed_total{kind, outcome}` | counter | Eventos resolvidos pelo consumer, por desfecho (`apply`, `duplicate`, `buffer`, `discard`, `plan_mismatch`, `tombstone`, `cache_duplicate`, `cache_aborted`) |
+| `nexus_events_drained_total` | counter | Eventos do buffer aplicados quando o antecessor chegou |
+| `nexus_dlq_messages_total{code}` | counter | Mensagens confirmadas pela DLQ, por codigo |
+| `nexus_consumer_retries_total` | counter | Falhas transitorias retentadas no lugar |
+| `nexus_event_settle_seconds` | histogram | Do primeiro processamento ate o evento ser resolvido, retries incluidos |
+| `nexus_consumer_lag{topic, partition}` | gauge | Registros atras do high watermark, apos cada lote |
+| `nexus_seq_cache_errors_total{op}` | counter | Falhas do cache Redis (cada uma desliga o cache por 5s) |
+| `nexus_webhook_deliveries_total{result}` | counter | Resultado de cada tentativa de entrega (`delivered`, `retry_scheduled`, `dead_max_attempts`, `dead_rejected`, `released`) |
+| `nexus_webhook_request_seconds` | histogram | Duracao das requisicoes de webhook |
+| `nexus_circuit_breaker_state` | gauge | 0 fechado, 1 semiaberto, 2 aberto |
+| `nexus_circuit_breaker_transitions_total{to}` | counter | Mudancas de estado do circuit breaker |
+| `nexus_outbox_entries{state}` | gauge | Notificacoes nao entregues: `pending` e `dead` (lido do Postgres no scrape) |
+| `nexus_pending_events` | gauge | Eventos no buffer de reordenacao (lido do Postgres no scrape) |
+
+Contadores com label nascem em zero, entao os paineis mostram `0` em vez de "sem dados". Um evento so e contado depois de resolvido: um retry nao conta o mesmo evento duas vezes, e um envio para a DLQ so conta depois do ack do broker.
+
 ## Quick Start
 
 ```bash
@@ -125,8 +149,9 @@ make agent-run
 make db-check
 
 # Abrir dashboards
-make grafana-open   # http://localhost:3000 (admin/nexus)
-make jaeger-open    # http://localhost:16686
+make grafana-open     # http://localhost:3000 (admin/nexus)
+make jaeger-open      # http://localhost:16686
+make prometheus-open  # http://localhost:9095
 ```
 
 ## Testes
@@ -139,7 +164,7 @@ O workflow `.github/workflows/ci.yml` roda em todo push, em qualquer branch:
 |---|---|
 | **Server (Go)** | `gofmt`, `go mod tidy` sem diff, `go vet` e `go test -race` com um Postgres 16 real; com `REQUIRE_INTEGRATION=1`, um teste de integracao sem banco falha em vez de ser pulado |
 | **Agent (Python)** | `pytest` do Agent Planner |
-| **E2E + Chaos** | sobe a stack com `docker compose`, roda o e2e (50 planos) e os 5 cenarios de chaos; so roda se os dois jobs acima passarem |
+| **E2E + Chaos** | sobe a stack com `docker compose`, roda o e2e (50 planos), os 5 cenarios de chaos e `scripts/check_metrics.py` (metricas coerentes com o que rodou, scrape do Prometheus, todas as queries do dashboard com dados, dashboard e datasource provisionados no Grafana); so roda se os dois jobs acima passarem |
 
 Um PR so deve ser aberto com o CI verde no ultimo commit.
 
@@ -276,6 +301,8 @@ make help  # Lista todos os comandos disponiveis
 | `make demo-e2e` | Demo E2E Exactly-Once |
 | `make chaos-test` | Chaos tests completos |
 | `make webhook-stats` | Entregas recebidas pelo webhook sink, por pedido |
+| `make metrics` | Metricas `nexus_*` expostas pelo server |
+| `make metrics-check` | Valida server, Prometheus e dashboard (depois de `demo-e2e` e `chaos-test`) |
 
 ## Fases do Projeto
 
@@ -290,3 +317,4 @@ make help  # Lista todos os comandos disponiveis
 | 7 | Correcao das garantias (ADR-004) | Completa |
 | 8 | Integracao continua (GitHub Actions) | Completa |
 | 9 | Entrega de webhooks (ADR-005) | Completa |
+| 10 | Metricas com Prometheus (ADR-006) | Completa |

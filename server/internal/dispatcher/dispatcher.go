@@ -24,6 +24,7 @@ import (
 
 	consulkv "github.com/user/nexus-server/internal/consul"
 	"github.com/user/nexus-server/internal/db"
+	"github.com/user/nexus-server/internal/metrics"
 )
 
 const bookkeepingTimeout = 5 * time.Second
@@ -88,18 +89,20 @@ type Dispatcher struct {
 	cfg        Config
 	cbSource   CBConfigSource
 	httpClient *http.Client
+	metrics    *metrics.Metrics
 
 	mu           sync.RWMutex
 	cb           *gobreaker.CircuitBreaker[int]
 	lastCBConfig consulkv.CBConfig
 }
 
-func New(store OutboxStore, cfg Config, cbSource CBConfigSource) *Dispatcher {
+func New(store OutboxStore, cfg Config, cbSource CBConfigSource, m *metrics.Metrics) *Dispatcher {
 	d := &Dispatcher{
 		store:      store,
 		cfg:        cfg.withDefaults(),
 		cbSource:   cbSource,
 		httpClient: &http.Client{},
+		metrics:    m,
 	}
 	d.refreshCircuitBreaker()
 	return d
@@ -139,10 +142,13 @@ func (d *Dispatcher) refreshCircuitBreaker() {
 				"from", from.String(),
 				"to", to.String(),
 			)
+			d.metrics.CircuitBreakerState.Set(cbStateValue(to))
+			d.metrics.CircuitBreakerTransitions.WithLabelValues(to.String()).Inc()
 		},
 	}
 
 	d.cb = gobreaker.NewCircuitBreaker[int](settings)
+	d.metrics.CircuitBreakerState.Set(cbStateValue(d.cb.State()))
 	d.lastCBConfig = newCfg
 }
 
@@ -247,11 +253,13 @@ func (d *Dispatcher) deliver(ctx context.Context, entry db.OutboxEntry) bool {
 			log.Error("recording webhook delivery failed", "error", err)
 			return false
 		}
+		d.metrics.WebhookDeliveries.WithLabelValues("delivered").Inc()
 		log.Info("webhook delivered", "status", status, "attempt", attempt)
 		return true
 
 	case errors.Is(err, gobreaker.ErrOpenState), errors.Is(err, gobreaker.ErrTooManyRequests), err != nil && ctx.Err() != nil:
 		// Not attempted, or interrupted by shutdown: give it back untouched.
+		d.metrics.WebhookDeliveries.WithLabelValues("released").Inc()
 		if err := d.store.ReleaseOutbox(bookCtx, entry.ID); err != nil {
 			log.Error("releasing outbox entry failed", "error", err)
 		}
@@ -261,8 +269,10 @@ func (d *Dispatcher) deliver(ctx context.Context, entry db.OutboxEntry) bool {
 		dead := attempt >= d.cfg.MaxAttempts
 		retryIn := backoff(attempt, d.cfg.RetryBase, d.cfg.RetryMax)
 		if dead {
+			d.metrics.WebhookDeliveries.WithLabelValues("dead_max_attempts").Inc()
 			log.Error("webhook dead-lettered after max attempts", "attempts", attempt, "error", err)
 		} else {
+			d.metrics.WebhookDeliveries.WithLabelValues("retry_scheduled").Inc()
 			log.Warn("webhook failed, retry scheduled", "attempt", attempt, "retry_in", retryIn.String(), "error", err)
 		}
 		if err := d.store.MarkOutboxFailed(bookCtx, entry.ID, retryIn, err.Error(), dead); err != nil {
@@ -272,6 +282,7 @@ func (d *Dispatcher) deliver(ctx context.Context, entry db.OutboxEntry) bool {
 
 	default:
 		// The receiver rejected this notification: retrying cannot help.
+		d.metrics.WebhookDeliveries.WithLabelValues("dead_rejected").Inc()
 		log.Error("webhook rejected, dead-lettered", "status", status)
 		reason := fmt.Sprintf("rejected with status %d", status)
 		if err := d.store.MarkOutboxFailed(bookCtx, entry.ID, 0, reason, true); err != nil {
@@ -302,7 +313,9 @@ func (d *Dispatcher) post(ctx context.Context, entry db.OutboxEntry) (int, error
 	req.Header.Set("X-Outbox-Position", strconv.FormatInt(entry.Position, 10))
 	req.Header.Set("X-Delivery-Attempt", strconv.Itoa(entry.Attempts+1))
 
+	start := time.Now()
 	resp, err := d.httpClient.Do(req)
+	d.metrics.WebhookRequestSeconds.Observe(time.Since(start).Seconds())
 	if err != nil {
 		return 0, err
 	}
@@ -325,4 +338,15 @@ func backoff(attempt int, base, maxDelay time.Duration) time.Duration {
 		d *= 2
 	}
 	return min(d, maxDelay)
+}
+
+func cbStateValue(s gobreaker.State) float64 {
+	switch s {
+	case gobreaker.StateOpen:
+		return metrics.CBOpen
+	case gobreaker.StateHalfOpen:
+		return metrics.CBHalfOpen
+	default:
+		return metrics.CBClosed
+	}
 }

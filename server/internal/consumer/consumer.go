@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/twmb/franz-go/pkg/kgo"
@@ -13,6 +15,7 @@ import (
 	"go.opentelemetry.io/otel/trace"
 
 	"github.com/user/nexus-server/internal/db"
+	"github.com/user/nexus-server/internal/metrics"
 	"github.com/user/nexus-server/internal/sequencing"
 	"github.com/user/nexus-server/internal/telemetry"
 	"github.com/user/nexus-server/pkg/models"
@@ -55,10 +58,11 @@ type DeadLetter interface {
 }
 
 type Consumer struct {
-	client *kgo.Client
-	store  Store
-	cache  SeqCache
-	dlq    DeadLetter
+	client  *kgo.Client
+	store   Store
+	cache   SeqCache
+	dlq     DeadLetter
+	metrics *metrics.Metrics
 
 	pendingTTL     time.Duration
 	retryBase      time.Duration
@@ -66,7 +70,7 @@ type Consumer struct {
 	cacheDownUntil time.Time // only touched by the Run goroutine
 }
 
-func New(brokers []string, topic, group string, pendingTTL time.Duration, store Store, cache SeqCache, dlq DeadLetter) (*Consumer, error) {
+func New(brokers []string, topic, group string, pendingTTL time.Duration, store Store, cache SeqCache, dlq DeadLetter, m *metrics.Metrics) (*Consumer, error) {
 	client, err := kgo.NewClient(
 		kgo.SeedBrokers(brokers...),
 		kgo.ConsumerGroup(group),
@@ -77,16 +81,17 @@ func New(brokers []string, topic, group string, pendingTTL time.Duration, store 
 		return nil, err
 	}
 
-	c := newConsumer(store, cache, dlq, pendingTTL)
+	c := newConsumer(store, cache, dlq, pendingTTL, m)
 	c.client = client
 	return c, nil
 }
 
-func newConsumer(store Store, cache SeqCache, dlq DeadLetter, pendingTTL time.Duration) *Consumer {
+func newConsumer(store Store, cache SeqCache, dlq DeadLetter, pendingTTL time.Duration, m *metrics.Metrics) *Consumer {
 	return &Consumer{
 		store:      store,
 		cache:      cache,
-		dlq:        dlq,
+		dlq:        countingDLQ{next: dlq, metrics: m},
+		metrics:    m,
 		pendingTTL: pendingTTL,
 		retryBase:  retryBaseDelay,
 		retryMax:   retryMaxDelay,
@@ -136,7 +141,22 @@ func (c *Consumer) Run(ctx context.Context) {
 			slog.Info("kafka consumer stopping")
 			return
 		}
+		c.recordLag(fetches)
 	}
+}
+
+// recordLag sets each fetched partition's lag once its whole batch is settled:
+// the high watermark reported with the fetch minus the next offset to consume.
+func (c *Consumer) recordLag(fetches kgo.Fetches) {
+	fetches.EachPartition(func(p kgo.FetchTopicPartition) {
+		if len(p.Records) == 0 {
+			return
+		}
+		next := p.Records[len(p.Records)-1].Offset + 1
+		c.metrics.ConsumerLag.
+			WithLabelValues(p.Topic, strconv.Itoa(int(p.Partition))).
+			Set(float64(max(p.HighWatermark-next, 0)))
+	})
 }
 
 // commit uses its own context so work finished right before shutdown is still
@@ -157,15 +177,18 @@ func (c *Consumer) commit(records []*kgo.Record) {
 // would let a later event of the same order overtake it, and committing past
 // it would lose it. Returns an error only when ctx is cancelled.
 func (c *Consumer) processWithRetry(ctx context.Context, record *kgo.Record) error {
+	start := time.Now()
 	delay := c.retryBase
 	for attempt := 1; ; attempt++ {
 		err := c.handleRecord(ctx, record)
 		if err == nil {
+			c.metrics.EventSettleSeconds.Observe(time.Since(start).Seconds())
 			return nil
 		}
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
+		c.metrics.ConsumerRetries.Inc()
 
 		slog.Warn("transient failure, retrying record",
 			"topic", record.Topic, "partition", record.Partition, "offset", record.Offset,
@@ -226,7 +249,8 @@ func (c *Consumer) handleRecord(ctx context.Context, record *kgo.Record) error {
 
 func (c *Consumer) handleSequenced(ctx context.Context, event *models.EventEnvelope) error {
 	seq := *event.SeqID
-	if c.skipFromCache(ctx, event.PlanID, seq) {
+	if skipped := c.skipFromCache(ctx, event.PlanID, seq); skipped != "" {
+		c.metrics.EventsProcessed.WithLabelValues("sequenced", skipped).Inc()
 		return nil
 	}
 
@@ -234,6 +258,15 @@ func (c *Consumer) handleSequenced(ctx context.Context, event *models.EventEnvel
 	if err != nil {
 		return c.handleStoreError(ctx, event, err)
 	}
+	if res.Outcome == sequencing.PlanMismatch {
+		if err := c.dlq.Send(ctx, event, "order belongs to another plan", "PLAN_MISMATCH"); err != nil {
+			return err
+		}
+	}
+	// Counted only once settled: a transient failure above is retried and must
+	// not count the same event twice.
+	c.metrics.EventsProcessed.WithLabelValues("sequenced", outcomeLabel(res.Outcome)).Inc()
+	c.metrics.EventsDrained.Add(float64(res.Drained))
 
 	switch res.Outcome {
 	case sequencing.Apply:
@@ -247,8 +280,6 @@ func (c *Consumer) handleSequenced(ctx context.Context, event *models.EventEnvel
 	case sequencing.Discard:
 		slog.Info("event for aborted plan discarded", "plan_id", event.PlanID, "seq_id", seq)
 		c.markAbortedInCache(ctx, event.PlanID)
-	case sequencing.PlanMismatch:
-		return c.dlq.Send(ctx, event, "order belongs to another plan", "PLAN_MISMATCH")
 	}
 	return nil
 }
@@ -258,6 +289,12 @@ func (c *Consumer) handleAbort(ctx context.Context, event *models.EventEnvelope)
 	if err != nil {
 		return c.handleStoreError(ctx, event, err)
 	}
+	if res.Outcome == sequencing.PlanMismatch {
+		if err := c.dlq.Send(ctx, event, "order belongs to another plan", "PLAN_MISMATCH"); err != nil {
+			return err
+		}
+	}
+	c.metrics.EventsProcessed.WithLabelValues("abort", outcomeLabel(res.Outcome)).Inc()
 
 	switch res.Outcome {
 	case sequencing.Apply, sequencing.Tombstone, sequencing.Duplicate:
@@ -265,10 +302,12 @@ func (c *Consumer) handleAbort(ctx context.Context, event *models.EventEnvelope)
 		c.markAbortedInCache(ctx, event.PlanID)
 	case sequencing.Discard:
 		slog.Info("ABORT_PLAN ignored: order already completed", "plan_id", event.PlanID, "order_id", event.OrderID)
-	case sequencing.PlanMismatch:
-		return c.dlq.Send(ctx, event, "order belongs to another plan", "PLAN_MISMATCH")
 	}
 	return nil
+}
+
+func outcomeLabel(o sequencing.Outcome) string {
+	return strings.ToLower(string(o))
 }
 
 func (c *Consumer) persist(ctx context.Context, spanName string, event *models.EventEnvelope,
@@ -298,26 +337,27 @@ func (c *Consumer) handleStoreError(ctx context.Context, event *models.EventEnve
 	return fmt.Errorf("store: %w", err)
 }
 
-// skipFromCache reports whether the cache alone proves the event needs no work.
+// skipFromCache reports why the cache alone proves the event needs no work
+// ("cache_aborted" or "cache_duplicate"), or "" when the Store must decide.
 // Any cache failure defers the decision to the Store.
-func (c *Consumer) skipFromCache(ctx context.Context, planID string, seq int) bool {
+func (c *Consumer) skipFromCache(ctx context.Context, planID string, seq int) string {
 	if !c.cacheAvailable() {
-		return false
+		return ""
 	}
 	lastSeq, aborted, err := c.cache.Lookup(ctx, planID)
 	if err != nil {
 		c.cacheFailed("lookup", err)
-		return false
+		return ""
 	}
 	if aborted {
 		slog.Info("event for aborted plan discarded (cache)", "plan_id", planID, "seq_id", seq)
-		return true
+		return "cache_aborted"
 	}
 	if seq <= lastSeq {
 		slog.Info("duplicate event ignored (cache)", "plan_id", planID, "seq_id", seq)
-		return true
+		return "cache_duplicate"
 	}
-	return false
+	return ""
 }
 
 func (c *Consumer) advanceCache(ctx context.Context, planID string, seq int) {
@@ -343,6 +383,7 @@ func (c *Consumer) cacheAvailable() bool {
 }
 
 func (c *Consumer) cacheFailed(op string, err error) {
+	c.metrics.SeqCacheErrors.WithLabelValues(op).Inc()
 	c.cacheDownUntil = time.Now().Add(cacheCooldown)
 	slog.Warn("seq cache unavailable, bypassing it", "op", op, "cooldown", cacheCooldown, "error", err)
 }
@@ -379,4 +420,26 @@ func (c *Consumer) expirePending(ctx context.Context) {
 			return
 		}
 	}
+}
+
+// countingDLQ counts dead letters by code once the broker acknowledged them.
+type countingDLQ struct {
+	next    DeadLetter
+	metrics *metrics.Metrics
+}
+
+func (d countingDLQ) Send(ctx context.Context, event *models.EventEnvelope, reason, code string) error {
+	if err := d.next.Send(ctx, event, reason, code); err != nil {
+		return err
+	}
+	d.metrics.DLQMessages.WithLabelValues(code).Inc()
+	return nil
+}
+
+func (d countingDLQ) SendRaw(ctx context.Context, raw []byte, reason, code string) error {
+	if err := d.next.SendRaw(ctx, raw, reason, code); err != nil {
+		return err
+	}
+	d.metrics.DLQMessages.WithLabelValues(code).Inc()
+	return nil
 }

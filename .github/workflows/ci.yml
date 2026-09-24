@@ -115,6 +115,11 @@ jobs:
       - name: Chaos (gaps, Redis restart, zombies, mensagens envenenadas, webhooks)
         run: python scripts/chaos_test.py --orders 10
 
+      # Depois do e2e e do chaos: valida os efeitos deles nas métricas, o scrape
+      # do Prometheus, cada query do dashboard e o provisionamento do Grafana.
+      - name: Métricas (server, Prometheus e dashboard do Grafana)
+        run: python scripts/check_metrics.py
+
       - name: Logs da stack
         if: failure()
         run: docker compose logs --no-color --tail=300

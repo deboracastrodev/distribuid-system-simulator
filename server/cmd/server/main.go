@@ -12,6 +12,9 @@ import (
 	"time"
 
 	consulapi "github.com/hashicorp/consul/api"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/collectors"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 
 	"github.com/user/nexus-server/internal/config"
 	consulkv "github.com/user/nexus-server/internal/consul"
@@ -19,6 +22,7 @@ import (
 	"github.com/user/nexus-server/internal/db"
 	"github.com/user/nexus-server/internal/dispatcher"
 	"github.com/user/nexus-server/internal/dlq"
+	"github.com/user/nexus-server/internal/metrics"
 	redisc "github.com/user/nexus-server/internal/redis"
 	"github.com/user/nexus-server/internal/telemetry"
 )
@@ -60,6 +64,18 @@ func main() {
 		os.Exit(1)
 	}
 
+	// --- Metrics ---
+	registry := prometheus.NewRegistry()
+	registry.MustRegister(
+		collectors.NewGoCollector(),
+		collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}),
+	)
+	m := metrics.New(registry)
+	if err := metrics.RegisterBacklog(registry, repo, 2*time.Second); err != nil {
+		slog.Error("registering backlog metrics failed", "error", err)
+		os.Exit(1)
+	}
+
 	// --- DLQ Producer ---
 	dlqProducer, err := dlq.New(cfg.KafkaBrokers, cfg.KafkaDLQTopic)
 	if err != nil {
@@ -68,7 +84,7 @@ func main() {
 	}
 
 	// --- Kafka Consumer ---
-	cons, err := consumer.New(cfg.KafkaBrokers, cfg.KafkaTopic, cfg.KafkaConsumerGroup, cfg.PendingEventTTL, repo, redisClient, dlqProducer)
+	cons, err := consumer.New(cfg.KafkaBrokers, cfg.KafkaTopic, cfg.KafkaConsumerGroup, cfg.PendingEventTTL, repo, redisClient, dlqProducer, m)
 	if err != nil {
 		slog.Error("kafka consumer init failed", "error", err)
 		os.Exit(1)
@@ -88,16 +104,16 @@ func main() {
 		Workers:      cfg.WebhookWorkers,
 		MaxAttempts:  cfg.WebhookMaxAttempts,
 		RetryBase:    cfg.WebhookRetryBase,
-	}, kvWatcher)
+	}, kvWatcher, m)
 	// --- Consul Registration ---
 	consulClient, serviceID, err := registerConsul(cfg)
 	if err != nil {
 		slog.Warn("Consul registration failed (non-fatal)", "error", err)
 	}
 
-	// --- Health HTTP server ---
-	healthMux := http.NewServeMux()
-	healthMux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
+	// --- HTTP server: /health and /metrics ---
+	mux := http.NewServeMux()
+	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
 		// Postgres is required to process events; the Redis cache is not.
 		if err := repo.Ping(r.Context()); err != nil {
 			http.Error(w, "postgres unhealthy", http.StatusServiceUnavailable)
@@ -110,7 +126,8 @@ func main() {
 		}
 		fmt.Fprint(w, "OK")
 	})
-	httpServer := &http.Server{Addr: fmt.Sprintf(":%d", cfg.ServicePort), Handler: healthMux}
+	mux.Handle("/metrics", promhttp.HandlerFor(registry, promhttp.HandlerOpts{}))
+	httpServer := &http.Server{Addr: fmt.Sprintf(":%d", cfg.ServicePort), Handler: mux}
 
 	// --- Start goroutines ---
 	var wg sync.WaitGroup
@@ -130,9 +147,9 @@ func main() {
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		slog.Info("health server listening", "port", cfg.ServicePort)
+		slog.Info("http server listening (health, metrics)", "port", cfg.ServicePort)
 		if err := httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			slog.Error("health server error", "error", err)
+			slog.Error("http server error", "error", err)
 		}
 	}()
 

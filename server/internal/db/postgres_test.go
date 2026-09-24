@@ -271,6 +271,35 @@ func TestApplyEvent_ConcurrentDeliveriesApplyEachEventOnce(t *testing.T) {
 	assert.Zero(t, countPending(t, repo, p.orderID))
 }
 
+func TestBacklogCounts(t *testing.T) {
+	repo := newRepo(t)
+	ctx := context.Background()
+	p := newPlan()
+	apply(t, repo, p.event(1))
+	apply(t, repo, p.event(2))
+	apply(t, repo, p.event(4)) // buffered
+
+	pending, dead, err := repo.OutboxBacklog(ctx)
+	require.NoError(t, err)
+	assert.Equal(t, [2]int64{2, 0}, [2]int64{pending, dead})
+	buffered, err := repo.PendingEventsCount(ctx)
+	require.NoError(t, err)
+	assert.Equal(t, int64(1), buffered)
+
+	claimed, err := repo.ClaimOutbox(ctx, 10, time.Minute)
+	require.NoError(t, err)
+	require.Len(t, claimed, 1, "only the order's head is claimable")
+	require.NoError(t, repo.MarkOutboxFailed(ctx, claimed[0].ID, 0, "rejected with status 400", true))
+	claimed, err = repo.ClaimOutbox(ctx, 10, time.Minute)
+	require.NoError(t, err)
+	require.Len(t, claimed, 1)
+	require.NoError(t, repo.MarkOutboxDelivered(ctx, claimed[0].ID))
+
+	pending, dead, err = repo.OutboxBacklog(ctx)
+	require.NoError(t, err)
+	assert.Equal(t, [2]int64{0, 1}, [2]int64{pending, dead}, "delivered entries leave the backlog; dead ones are counted apart")
+}
+
 func TestExpirePending(t *testing.T) {
 	repo := newRepo(t)
 	ctx := context.Background()

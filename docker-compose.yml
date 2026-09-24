@@ -185,11 +185,28 @@ services:
     networks:
       - nexus
 
+  prometheus:
+    image: prom/prometheus:v3.13.3
+    container_name: nexus-prometheus
+    volumes:
+      - ./monitoring/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    ports:
+      - "9095:9090" # 9090 já é do webhook-sink
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:9090/-/ready"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    networks:
+      - nexus
+
   grafana:
     image: grafana/grafana-oss:latest
     container_name: nexus-grafana
     depends_on:
       jaeger:
+        condition: service_healthy
+      prometheus:
         condition: service_healthy
     ports:
       - "3000:3000"

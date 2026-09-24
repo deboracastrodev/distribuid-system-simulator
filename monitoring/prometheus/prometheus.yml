@@ -1,0 +1,10 @@
+# Scrape do server Go. Montado no caminho padrão da imagem, então o command
+# padrão (config e storage) continua valendo.
+global:
+  scrape_interval: 5s
+  evaluation_interval: 5s
+
+scrape_configs:
+  - job_name: nexus-server
+    static_configs:
+      - targets: ["server:8080"]
