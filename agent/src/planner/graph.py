@@ -1,9 +1,13 @@
 """Grafo LangGraph do Agent Planner.
 
 Fluxo:
-  START -> generate_plan -> [abort | create_order_event]
-  create_order_event -> create_inventory_event -> create_payment_event
-  -> create_shipping_event -> create_completion_event -> END
+  START -> generate_plan -> [abort_plan | create_order_event]
+  create_order_event -> create_inventory_event -> [abort_plan | create_payment_event]
+  create_payment_event -> [abort_plan | create_shipping_event]
+  create_shipping_event -> create_completion_event -> END
+
+Estoque e pagamento podem falhar conforme a simulação no state
+(src/planner/simulation.py); a falha leva ao abort_plan com o código do passo.
 """
 
 from __future__ import annotations
@@ -22,11 +26,11 @@ from src.planner.nodes import (
 from src.planner.state import PlanState
 
 
-def _route_after_plan(state: PlanState) -> str:
-    """Redireciona para abort se validacao falhou."""
-    if state["status"] == "aborted":
-        return "abort_plan"
-    return "create_order_event"
+def _abort_or(next_node: str):
+    """Roteador: abort_plan se o node anterior abortou, senão next_node."""
+    def route(state: PlanState) -> str:
+        return "abort_plan" if state["status"] == "aborted" else next_node
+    return route
 
 
 def build_graph():
@@ -44,14 +48,17 @@ def build_graph():
 
     # Edges (paths explicitos para visualizacao no LangGraph Studio)
     graph.set_entry_point("generate_plan")
-    graph.add_conditional_edges(
-        "generate_plan",
-        _route_after_plan,
-        {"abort_plan": "abort_plan", "create_order_event": "create_order_event"},
-    )
+    for node, next_node in (
+        ("generate_plan", "create_order_event"),
+        ("create_inventory_event", "create_payment_event"),
+        ("create_payment_event", "create_shipping_event"),
+    ):
+        graph.add_conditional_edges(
+            node,
+            _abort_or(next_node),
+            {"abort_plan": "abort_plan", next_node: next_node},
+        )
     graph.add_edge("create_order_event", "create_inventory_event")
-    graph.add_edge("create_inventory_event", "create_payment_event")
-    graph.add_edge("create_payment_event", "create_shipping_event")
     graph.add_edge("create_shipping_event", "create_completion_event")
     graph.add_edge("create_completion_event", END)
     graph.add_edge("abort_plan", END)

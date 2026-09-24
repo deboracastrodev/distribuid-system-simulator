@@ -7,7 +7,6 @@ import logging
 
 from confluent_kafka import KafkaException, Producer
 from opentelemetry import trace
-from opentelemetry.context import get_current
 
 from src.config import KAFKA_BOOTSTRAP_SERVERS, KAFKA_TOPIC
 
@@ -59,34 +58,41 @@ def _build_traceparent(span: trace.Span) -> str:
     return f"00-{format(ctx.trace_id, '032x')}-{format(ctx.span_id, '016x')}-01"
 
 
-def publish_plan(producer: Producer, events: list[dict]) -> None:
-    """Publica todos os eventos de um plano em sequencia e faz flush."""
-    with tracer.start_as_current_span("publish-plan") as plan_span:
-        plan_id = events[0]["plan_id"] if events else "unknown"
-        plan_span.set_attribute("plan.id", plan_id)
-        plan_span.set_attribute("plan.event_count", len(events))
+class PublishError(Exception):
+    """O broker não confirmou a entrega de um evento."""
 
-        for event in events:
-            with tracer.start_as_current_span(
-                f"publish-event-{event.get('event_type', 'unknown')}"
-            ) as event_span:
-                event_span.set_attribute("event.type", event.get("event_type", ""))
-                event_span.set_attribute("event.seq_id", event.get("seq_id", 0))
 
-                traceparent = _build_traceparent(event_span)
-                producer.produce(
-                    topic=KAFKA_TOPIC,
-                    key=event["order_id"],
-                    value=json.dumps(event).encode(),
-                    headers=[("traceparent", traceparent.encode())],
-                    callback=_delivery_callback,
-                )
+def publish_event(producer: Producer, event: dict, timeout: float = 10.0) -> None:
+    """Publica um evento e espera a confirmação do broker.
 
-        # Processar callbacks pendentes de uma vez (nao dentro do loop)
-        producer.poll(0)
+    Levanta PublishError se a entrega falhar ou não for confirmada no prazo:
+    um plano publicado pela metade deixaria o server esperando um evento que
+    nunca chega, então quem chama precisa saber.
+    """
+    with tracer.start_as_current_span(
+        f"publish-event-{event.get('event_type', 'unknown')}"
+    ) as span:
+        span.set_attribute("event.type", event.get("event_type", ""))
+        span.set_attribute("event.plan_id", event.get("plan_id", ""))
+        span.set_attribute("event.seq_id", event.get("seq_id", 0))
 
-        remaining = producer.flush(timeout=10)
-        if remaining > 0:
-            logger.warning("%d mensagens nao entregues apos flush", remaining)
-        else:
-            logger.info("Plano %s: %d eventos entregues com sucesso", plan_id, len(events))
+        errors: list = []
+
+        def on_delivery(err, msg):
+            if err:
+                errors.append(err)
+            else:
+                _delivery_callback(err, msg)
+
+        producer.produce(
+            topic=KAFKA_TOPIC,
+            key=event["order_id"],
+            value=json.dumps(event).encode(),
+            headers=[("traceparent", _build_traceparent(span).encode())],
+            callback=on_delivery,
+        )
+        remaining = producer.flush(timeout=timeout)
+        if errors:
+            raise PublishError(f"entrega de {event['event_type']} falhou: {errors[0]}")
+        if remaining:
+            raise PublishError(f"entrega de {event['event_type']} não confirmada em {timeout}s")

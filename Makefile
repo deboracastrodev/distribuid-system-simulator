@@ -1,4 +1,4 @@
-.PHONY: help up down down-clean restart status logs validate wait agent-build agent-run agent-dry-run agent-abort-test chaos-test chaos-test-gaps chaos-test-redis chaos-test-zombie chaos-test-poison chaos-test-webhook webhook-stats metrics metrics-check prometheus-open grafana-open jaeger-open
+.PHONY: help up down down-clean restart status logs validate wait agent-build agent-run agent-dry-run agent-abort-test agent-simulate agent-check agent-e2e chaos-test chaos-test-gaps chaos-test-redis chaos-test-zombie chaos-test-poison chaos-test-webhook webhook-stats metrics metrics-check prometheus-open grafana-open jaeger-open
 
 help: ## Exibe esta ajuda
 	@grep -E '^[a-zA-Z_%-]+:.*?## .*$$' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-15s\033[0m %s\n", $$1, $$2}'
@@ -43,6 +43,20 @@ agent-dry-run: ## Gera eventos sem publicar no Kafka
 
 agent-order: ## Publica pedido custom (ex: make agent-order ORDER='{"user_id":"u1","items":[...],"total_amount":10}')
 	@docker compose run --rm agent python -m src.main --order '$(ORDER)'
+
+agent-simulate: ## Gera planos com falhas simuladas (ex: make agent-simulate ORDERS=50 INV_RATE=0.3 PAY_RATE=0.2 SEED=demo DELAY_MS=200)
+	@docker compose run --rm --user "$$(id -u):$$(id -g)" -v "$(CURDIR):/out" agent python -m src.main \
+		--orders $(or $(ORDERS),20) \
+		--inventory-failure-rate $(or $(INV_RATE),0.2) \
+		--payment-rejection-rate $(or $(PAY_RATE),0.25) \
+		--step-delay-ms $(or $(DELAY_MS),0) \
+		$(if $(SEED),--seed $(SEED)) \
+		--report /out/agent-report.json
+
+agent-check: ## Confere no Postgres e no webhook sink o desfecho de cada plano de agent-report.json
+	@$(CHAOS_PYTHON) scripts/check_agent_outcomes.py agent-report.json
+
+agent-e2e: agent-simulate agent-check ## agent-simulate + agent-check (requer infra up e chaos-deps)
 
 agent-test: ## Roda testes unitários do Agent Python via Docker
 	@docker compose run --rm --no-deps agent python -m pytest tests/ -v

@@ -30,8 +30,11 @@ sequenceDiagram
     participant Postgres
 
     Agent->>Agent: generate_plan (valida items/amount)
-    loop Para cada evento (seq 1..5)
-        Agent->>Kafka: EventEnvelope {plan_id, seq_id, event_type}
+    loop Para cada passo do plano (seq 1..5)
+        Agent->>Kafka: EventEnvelope {plan_id, seq_id, event_type}, publicado assim que o node o gera
+    end
+    opt estoque indisponivel ou pagamento recusado (simulados)
+        Agent->>Kafka: ABORT_PLAN {abort_code, aborted_at_seq}
     end
 
     Kafka->>Server: Poll records (manual commit)
@@ -145,6 +148,9 @@ make status
 # Executar o agent (gera 1 pedido completo)
 make agent-run
 
+# Ou gerar carga com falhas simuladas (20 planos) e conferir o desfecho de cada um
+make agent-e2e
+
 # Verificar resultado no banco
 make db-check
 
@@ -164,7 +170,7 @@ O workflow `.github/workflows/ci.yml` roda em todo push, em qualquer branch:
 |---|---|
 | **Server (Go)** | `gofmt`, `go mod tidy` sem diff, `go vet` e `go test -race` com um Postgres 16 real; com `REQUIRE_INTEGRATION=1`, um teste de integracao sem banco falha em vez de ser pulado |
 | **Agent (Python)** | `pytest` do Agent Planner |
-| **E2E + Chaos** | sobe a stack com `docker compose`, roda o e2e (50 planos), os 5 cenarios de chaos e `scripts/check_metrics.py` (metricas coerentes com o que rodou, scrape do Prometheus, todas as queries do dashboard com dados, dashboard e datasource provisionados no Grafana); so roda se os dois jobs acima passarem |
+| **E2E + Chaos** | sobe a stack com `docker compose`, roda o e2e (50 planos), o agent com falhas simuladas (40 planos, conferidos por `scripts/check_agent_outcomes.py`), os 5 cenarios de chaos e `scripts/check_metrics.py` (metricas coerentes com o que rodou, scrape do Prometheus, todas as queries do dashboard com dados, dashboard e datasource provisionados no Grafana); so roda se os dois jobs acima passarem |
 
 Um PR so deve ser aberto com o CI verde no ultimo commit.
 
@@ -189,11 +195,46 @@ make demo-e2e
 # Demo E2E com 100 planos
 make demo-e2e PLANS=100
 
+# Agent com falhas simuladas + conferencia no Postgres e no webhook sink (requer `make chaos-deps`)
+make agent-e2e
+
 # Chaos tests: sequence gaps, Redis restart (sem reenvio), zombie events, mensagens envenenadas (DLQ)
 # e entrega de webhooks com receptor instavel
 # Requer `make chaos-deps` e acesso ao Docker (o cenario Redis derruba o container nexus-redis)
 make chaos-test
 ```
+
+## Simulacao de Falhas no Agent
+
+Por padrao o agent gera o caminho feliz. Com as taxas de simulacao, o estoque falha ou o pagamento e recusado em uma fracao dos planos, que terminam em `ABORT_PLAN` com `abort_code` `inventory_failed` ou `payment_rejected`:
+
+| Desfecho | Eventos publicados | Estado no Postgres | Notificacoes (outbox) |
+|---|---|---|---|
+| completo | seq 1..5 | `completed`, seq 5 | 5 |
+| estoque indisponivel | `OrderCreated`, `ABORT_PLAN` (`aborted_at_seq` 1) | `aborted`, seq 1 | 2 |
+| pagamento recusado | `OrderCreated`, `InventoryValidated`, `ABORT_PLAN` (`aborted_at_seq` 2) | `aborted`, seq 2 | 3 |
+
+Um pagamento recusado nao gera `PaymentProcessed`: o server marcaria o pedido como `payment_processed`.
+
+```bash
+cd agent
+python -m src.main --orders 50 \
+  --inventory-failure-rate 0.2 --payment-rejection-rate 0.25 \
+  --step-delay-ms 200 --seed demo --report ../agent-report.json
+```
+
+| Flag | Env (default) | Descricao |
+|---|---|---|
+| `--orders N` | | Planos a gerar; cada um com um `order_id` novo |
+| `--inventory-failure-rate` | `SIM_INVENTORY_FAILURE_RATE` (0) | Fracao dos planos em que o estoque falha |
+| `--payment-rejection-rate` | `SIM_PAYMENT_REJECTION_RATE` (0) | Fracao dos planos que chegam ao pagamento e tem o pagamento recusado |
+| `--step-delay-ms` | `SIM_STEP_DELAY_MS` (0) | Atraso entre eventos do mesmo plano |
+| `--seed` | aleatoria | Reproduz as mesmas decisoes: o plano na posicao `i` usa a seed `<seed>:<i>` |
+| `--report` | | Grava o desfecho de cada plano (eventos, `last_seq`, seed do plano) em JSON |
+
+Cada evento e publicado assim que o node do grafo o gera, e o agent espera o ack do broker antes de seguir: se a publicacao falhar, o agent para, grava o relatorio parcial e sai com codigo 1, em vez de deixar o plano pela metade sem aviso.
+
+`scripts/check_agent_outcomes.py agent-report.json` confere cada plano do relatorio no Postgres (status, `last_seq_processed`, `plan_id`, uma entrada do outbox por evento aplicado, todas entregues) e no webhook sink (cada entrega aceita uma vez e em ordem), e exige que cada tipo de falha com taxa > 0 tenha acontecido. `make agent-e2e` roda os dois (`ORDERS`, `INV_RATE`, `PAY_RATE`, `SEED` e `DELAY_MS` ajustam a simulacao).
 
 ## LangGraph Studio (Visualizacao do Grafo)
 
@@ -250,6 +291,14 @@ make agent-studio
 }
 ```
 
+**Falha simulada (pagamento recusado):** adicione o campo `simulation` a qualquer um dos inputs acima. As decisoes dependem so da seed, entao o mesmo input sempre segue o mesmo caminho; `plan_id` e `order_id` nao influenciam.
+
+```json
+{
+  "simulation": {"inventory_failure_rate": 0, "payment_rejection_rate": 1, "seed": "studio"}
+}
+```
+
 > Requer `LANGSMITH_API_KEY` no `agent/.env`. Crie uma conta gratuita em [LangSmith](https://smith.langchain.com/) e copie a API key.
 
 ## Estrutura do Projeto
@@ -258,8 +307,10 @@ make agent-studio
 .
 ├── agent/                   # Agent Python (LangGraph)
 │   ├── src/
-│   │   ├── planner/         # Grafo LangGraph (nodes, state)
+│   │   ├── planner/         # Grafo LangGraph (nodes, state, simulacao de falhas)
+│   │   ├── producer/        # Producer Kafka (ack por evento)
 │   │   ├── models/          # Pydantic models (EventEnvelope)
+│   │   ├── runner.py        # Executa o grafo e publica cada evento ao ser gerado
 │   │   └── config.py
 │   └── tests/               # pytest (unit tests)
 ├── server/                  # Server Go (Event Processor)
@@ -275,7 +326,10 @@ make agent-studio
 │   └── scripts/lua/         # advance_seq.lua
 ├── scripts/
 │   ├── chaos_test.py        # Chaos testing scenarios
-│   └── e2e_demo.py          # Demo E2E com validacao
+│   ├── e2e_demo.py          # Demo E2E com validacao
+│   ├── check_agent_outcomes.py  # Confere o relatorio do agent no Postgres e no webhook sink
+│   ├── check_metrics.py     # Valida server -> Prometheus -> dashboard
+│   └── webhook_sink.py      # Receptor de webhooks para testes
 ├── monitoring/grafana/      # Dashboards + provisioning
 ├── docker-compose.yml
 ├── init.sql                 # Schema Postgres
@@ -296,6 +350,8 @@ make help  # Lista todos os comandos disponiveis
 | `make down` | Derruba containers |
 | `make status` | Status dos containers |
 | `make agent-run` | Executa o agent (1 pedido) |
+| `make agent-simulate` | Gera planos com falhas simuladas e grava `agent-report.json` |
+| `make agent-e2e` | `agent-simulate` + conferencia no Postgres e no webhook sink |
 | `make server-test` | Testes Go (sem infra) |
 | `make agent-test` | Testes unitarios Python |
 | `make demo-e2e` | Demo E2E Exactly-Once |
@@ -318,3 +374,4 @@ make help  # Lista todos os comandos disponiveis
 | 8 | Integracao continua (GitHub Actions) | Completa |
 | 9 | Entrega de webhooks (ADR-005) | Completa |
 | 10 | Metricas com Prometheus (ADR-006) | Completa |
+| 11 | Agent com falhas simuladas | Completa |
