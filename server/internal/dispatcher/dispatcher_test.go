@@ -17,7 +17,6 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	consulkv "github.com/user/nexus-server/internal/consul"
 	"github.com/user/nexus-server/internal/db"
 	"github.com/user/nexus-server/internal/metrics"
 	"github.com/user/nexus-server/internal/testutil/pgtest"
@@ -44,12 +43,6 @@ func TestRetryableStatus(t *testing.T) {
 }
 
 // --- integration (Postgres + HTTP receiver) ---
-
-type staticCB consulkv.CBConfig
-
-func (s staticCB) Config() consulkv.CBConfig { return consulkv.CBConfig(s) }
-
-func defaultCB() staticCB { return staticCB(consulkv.DefaultCBConfig()) }
 
 type request struct {
 	key       string
@@ -203,7 +196,7 @@ func TestRequestCarriesIdempotencyKeyAndPosition(t *testing.T) {
 	e := newEnv(t)
 	rcv, url := newReceiver(t, always(200))
 	agg, ids := e.seed(t, 1)
-	d := New(e.repo, testConfig(url), defaultCB(), metrics.NewForTest())
+	d := New(e.repo, testConfig(url), metrics.NewForTest())
 
 	delivered, err := d.dispatchBatch(context.Background())
 	require.NoError(t, err)
@@ -233,7 +226,7 @@ func TestFailedEntryHoldsBackOnlyItsSuccessors(t *testing.T) {
 		}
 		return 200
 	})
-	d := New(e.repo, testConfig(url), defaultCB(), metrics.NewForTest())
+	d := New(e.repo, testConfig(url), metrics.NewForTest())
 
 	_, err := d.dispatchBatch(context.Background())
 	require.NoError(t, err)
@@ -259,7 +252,9 @@ func TestFailingOrderDoesNotBlockOthers(t *testing.T) {
 		}
 		return 200
 	})
-	d := New(e.repo, testConfig(url), staticCB{FailureThreshold: 1000, SuccessThreshold: 1, Timeout: time.Second, OpenDuration: time.Minute}, metrics.NewForTest())
+	cfg := testConfig(url)
+	cfg.Breaker = Breaker{FailureThreshold: 1000, SuccessThreshold: 1, OpenDuration: time.Minute, RequestTimeout: time.Second}
+	d := New(e.repo, cfg, metrics.NewForTest())
 
 	dispatchUntil(t, d, func() bool {
 		for _, id := range healthyIDs {
@@ -288,7 +283,7 @@ func TestRejectedEntryIsDeadLetteredWithoutRetry(t *testing.T) {
 		}
 		return 200
 	})
-	d := New(e.repo, testConfig(url), defaultCB(), metrics.NewForTest())
+	d := New(e.repo, testConfig(url), metrics.NewForTest())
 
 	dispatchUntil(t, d, func() bool { return e.row(t, ids[1]).processed })
 
@@ -307,7 +302,7 @@ func TestRetryableFailureIsDeadLetteredAfterMaxAttempts(t *testing.T) {
 	rcv, url := newReceiver(t, always(503))
 	cfg := testConfig(url)
 	cfg.MaxAttempts = 3
-	d := New(e.repo, cfg, defaultCB(), metrics.NewForTest())
+	d := New(e.repo, cfg, metrics.NewForTest())
 
 	dispatchUntil(t, d, func() bool { return e.row(t, ids[0]).dead })
 
@@ -326,7 +321,7 @@ func TestConcurrentDispatchersDeliverEachEntryOnceInOrder(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	var wg sync.WaitGroup
 	for i := 0; i < 2; i++ {
-		d := New(e.repo, testConfig(url), defaultCB(), metrics.NewForTest())
+		d := New(e.repo, testConfig(url), metrics.NewForTest())
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
@@ -354,7 +349,7 @@ func TestExpiredLeaseIsClaimedAgain(t *testing.T) {
 	e := newEnv(t)
 	_, ids := e.seed(t, 1)
 	rcv, url := newReceiver(t, always(200))
-	d := New(e.repo, testConfig(url), defaultCB(), metrics.NewForTest())
+	d := New(e.repo, testConfig(url), metrics.NewForTest())
 
 	// A dispatcher claims the entry and dies before delivering it.
 	claimed, err := e.repo.ClaimOutbox(context.Background(), 10, 200*time.Millisecond)
@@ -377,7 +372,8 @@ func TestOpenCircuitLeavesEntriesUntouched(t *testing.T) {
 	rcv, url := newReceiver(t, always(503))
 	cfg := testConfig(url)
 	cfg.Workers = 1
-	d := New(e.repo, cfg, staticCB{FailureThreshold: 1, SuccessThreshold: 1, Timeout: time.Second, OpenDuration: time.Minute}, metrics.NewForTest())
+	cfg.Breaker = Breaker{FailureThreshold: 1, SuccessThreshold: 1, OpenDuration: time.Minute, RequestTimeout: time.Second}
+	d := New(e.repo, cfg, metrics.NewForTest())
 
 	_, err := d.dispatchBatch(context.Background()) // one failure opens the circuit
 	require.NoError(t, err)
@@ -410,7 +406,7 @@ func TestDeliveryCompletedDuringShutdownIsRecorded(t *testing.T) {
 	e := newEnv(t)
 	_, ids := e.seed(t, 1)
 	rcv, url := newReceiver(t, always(200))
-	d := New(e.repo, testConfig(url), defaultCB(), metrics.NewForTest())
+	d := New(e.repo, testConfig(url), metrics.NewForTest())
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -432,7 +428,7 @@ func TestShutdownReleasesInFlightEntry(t *testing.T) {
 		time.Sleep(300 * time.Millisecond)
 		return 200
 	})
-	d := New(e.repo, testConfig(url), defaultCB(), metrics.NewForTest())
+	d := New(e.repo, testConfig(url), metrics.NewForTest())
 
 	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
 	defer cancel()

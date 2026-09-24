@@ -59,14 +59,8 @@ echo ""
 check "Postgres (pg_isready)" \
   docker compose exec -T postgres pg_isready -U nexus_user -d nexus_db
 
-check "Redis (ping com auth)" \
-  docker compose exec -T redis redis-cli -a nexus_pass ping
-
 check "Kafka (listar tópicos)" \
   docker compose exec -T kafka /opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:29092 --list
-
-check "Consul (members)" \
-  docker compose exec -T consul consul members
 
 check "Jaeger (UI HTTP)" \
   docker compose exec -T jaeger wget -q -O /dev/null http://localhost:16686
@@ -83,12 +77,6 @@ echo ""
 # Usa o container postgres (Debian + bash) que suporta /dev/tcp
 PASS=0
 FAIL=0
-
-check "Postgres → Redis (porta 6379)" \
-  docker compose exec -T postgres bash -c "echo > /dev/tcp/redis/6379"
-
-check "Postgres → Consul (porta 8500)" \
-  docker compose exec -T postgres bash -c "echo > /dev/tcp/consul/8500"
 
 check "Postgres → Kafka (porta 29092 INTERNAL)" \
   docker compose exec -T postgres bash -c "echo > /dev/tcp/kafka/29092"

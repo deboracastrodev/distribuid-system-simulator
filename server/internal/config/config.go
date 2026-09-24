@@ -15,15 +15,9 @@ type Config struct {
 	KafkaDLQTopic      string
 	KafkaConsumerGroup string
 
-	RedisAddr     string
-	RedisPassword string
-
 	PostgresDSN string
 
-	ConsulAddr     string
-	ServiceName    string
-	ServicePort    int
-	HealthCheckTTL time.Duration
+	ServicePort int
 
 	OTELEndpoint    string
 	OTELServiceName string
@@ -34,11 +28,15 @@ type Config struct {
 	WebhookRetryBase   time.Duration
 	OutboxPollInterval time.Duration
 
+	// Circuit breaker in front of the webhook receiver.
+	WebhookCBFailureThreshold int
+	WebhookCBSuccessThreshold int
+	WebhookCBOpenDuration     time.Duration
+	WebhookTimeout            time.Duration
+
 	// PendingEventTTL is how long an out-of-order event waits for its
 	// predecessor before it is sent to the DLQ.
 	PendingEventTTL time.Duration
-
-	LuaScriptPath string
 }
 
 func Load() (*Config, error) {
@@ -51,15 +49,9 @@ func Load() (*Config, error) {
 		KafkaDLQTopic:      envOrDefault("KAFKA_DLQ_TOPIC", "orders-dlq"),
 		KafkaConsumerGroup: envOrDefault("KAFKA_CONSUMER_GROUP", "nexus-server-group"),
 
-		RedisAddr:     envOrDefault("REDIS_ADDR", "redis:6379"),
-		RedisPassword: envOrDefault("REDIS_PASSWORD", "nexus_pass"),
-
 		PostgresDSN: envOrDefault("POSTGRES_DSN", "postgres://nexus_user:nexus_pass@postgres:5432/nexus_db?sslmode=disable"),
 
-		ConsulAddr:     envOrDefault("CONSUL_ADDR", "consul:8500"),
-		ServiceName:    envOrDefault("SERVICE_NAME", "nexus-server"),
-		ServicePort:    envOrDefaultInt("SERVICE_PORT", 8080),
-		HealthCheckTTL: 30 * time.Second,
+		ServicePort: envOrDefaultInt("SERVICE_PORT", 8080),
 
 		OTELEndpoint:    envOrDefault("OTEL_EXPORTER_OTLP_ENDPOINT", "jaeger:4317"),
 		OTELServiceName: envOrDefault("OTEL_SERVICE_NAME", "nexus-server"),
@@ -70,9 +62,12 @@ func Load() (*Config, error) {
 		WebhookRetryBase:   1 * time.Second,
 		OutboxPollInterval: 2 * time.Second,
 
-		PendingEventTTL: 1 * time.Hour,
+		WebhookCBFailureThreshold: envOrDefaultInt("WEBHOOK_CB_FAILURE_THRESHOLD", 5),
+		WebhookCBSuccessThreshold: envOrDefaultInt("WEBHOOK_CB_SUCCESS_THRESHOLD", 2),
+		WebhookCBOpenDuration:     envOrDefaultDuration("WEBHOOK_CB_OPEN_DURATION", 30*time.Second),
+		WebhookTimeout:            envOrDefaultDuration("WEBHOOK_TIMEOUT", 10*time.Second),
 
-		LuaScriptPath: envOrDefault("LUA_SCRIPT_PATH", "/app/scripts/lua/advance_seq.lua"),
+		PendingEventTTL: 1 * time.Hour,
 	}
 
 	if err := cfg.validate(); err != nil {
@@ -121,6 +116,12 @@ func (c *Config) validate() error {
 	if c.PostgresDSN == "" {
 		return fmt.Errorf("POSTGRES_DSN is required")
 	}
+	if c.WebhookCBFailureThreshold < 1 || c.WebhookCBSuccessThreshold < 1 {
+		return fmt.Errorf("WEBHOOK_CB_FAILURE_THRESHOLD and WEBHOOK_CB_SUCCESS_THRESHOLD must be >= 1")
+	}
+	if c.WebhookCBOpenDuration <= 0 || c.WebhookTimeout <= 0 {
+		return fmt.Errorf("WEBHOOK_CB_OPEN_DURATION and WEBHOOK_TIMEOUT must be positive durations (e.g. 30s)")
+	}
 	return nil
 }
 
@@ -138,4 +139,18 @@ func envOrDefaultInt(key string, fallback int) int {
 		}
 	}
 	return fallback
+}
+
+// envOrDefaultDuration parses a Go duration ("30s", "1m"). An unparsable value
+// yields 0, which validate rejects, instead of silently using the default.
+func envOrDefaultDuration(key string, fallback time.Duration) time.Duration {
+	v := os.Getenv(key)
+	if v == "" {
+		return fallback
+	}
+	d, err := time.ParseDuration(v)
+	if err != nil {
+		return 0
+	}
+	return d
 }

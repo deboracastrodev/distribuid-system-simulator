@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""E2E Demo - Demonstracao de Exactly-Once do Nexus Event Gateway.
+"""E2E Demo - cada evento aplicado e notificado exatamente uma vez no Nexus Event Gateway.
 
 Envia N planos completos via Kafka, aguarda processamento e valida
 que o Postgres tem exatamente os registros esperados.
@@ -148,7 +148,7 @@ def wait_and_verify(plans: list[tuple[str, str]], timeout: int = 60) -> bool:
         print(f"  Pedidos incompletos:  0")
 
     success = completed == len(plans) and not duplicates
-    print(f"\n  {'RESULTADO: EXACTLY-ONCE VALIDADO' if success else 'RESULTADO: FALHA - VERIFICAR LOGS'}")
+    print(f"\n  {'RESULTADO: CADA EVENTO APLICADO E NOTIFICADO UMA VEZ' if success else 'RESULTADO: FALHA - VERIFICAR LOGS'}")
     print(f"{'='*60}\n")
 
     cur.close()

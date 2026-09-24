@@ -121,7 +121,7 @@ jobs:
             --seed ci --report /out/agent-report.json
           python scripts/check_agent_outcomes.py agent-report.json
 
-      - name: Chaos (gaps, Redis restart, zombies, mensagens envenenadas, webhooks)
+      - name: Chaos (gaps, crash do server, zombies, mensagens envenenadas, webhooks)
         run: python scripts/chaos_test.py --orders 10
 
       # Depois do e2e e do chaos: valida os efeitos deles nas métricas, o scrape

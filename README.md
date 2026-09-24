@@ -2,18 +2,18 @@
 
 [![CI](https://github.com/deboracastrodev/distribuid-system-simulator/actions/workflows/ci.yml/badge.svg)](https://github.com/deboracastrodev/distribuid-system-simulator/actions/workflows/ci.yml)
 
-Simulador de sistema distribuido com garantias **Exactly-Once** para processamento de eventos de pedidos.
+Gateway de **execucao segura de planos de agentes de IA**. O agente propoe os passos de um processo (aqui, um pedido de e-commerce); o gateway decide numa transacao se cada passo vale, aplica uma vez e na ordem, e avisa o mundo externo uma vez e na ordem. Agentes repetem acoes, se perdem no meio, reiniciam e alucinam passos: o gateway nao confia no agente, e nenhuma dessas falhas pode virar um efeito duplicado ou fora de ordem.
+
+**Estado atual:** as garantias de transporte estao implementadas e provadas no CI a cada push. Isso inclui evento repetido, ordem trocada, evento atrasado de plano abortado, mensagem invalida, crash do gateway e receptor instavel. O gateway ainda **nao** valida o conteudo do plano (passo fora da ordem do processo, valores) nem o ciclo de vida do plano (agente que reinicia, passo que nunca chega). O catalogo de falhas, com o que esta coberto e o que falta, e o roteiro estao no [ADR-007](docs/blueprint-arquitetura.md#adr-007-tese-do-projeto--execução-segura-de-planos-de-agentes-de-ia).
 
 ## Arquitetura
 
 ```mermaid
 graph LR
-    A[Agent Python<br/>LangGraph] -->|Kafka| B[Server Go<br/>Event Processor]
-    B -.->|cache| C[(Redis<br/>Lua Script)]
+    A[Agent Python<br/>LangGraph] -->|Kafka| B[Server Go<br/>Gateway]
     B --> D[(Postgres<br/>Source of Truth)]
     B --> E[DLQ<br/>Dead Letter Queue]
     B -->|Webhooks do outbox| W[Webhook Sink<br/>receptor de teste]
-    F[Consul] -.->|Service Discovery<br/>Circuit Breaker| B
     G[Jaeger] -.->|Traces OTLP| A & B
     P[Prometheus] -.->|scrape /metrics| B
     H[Grafana] -.->|Dashboards| G & P
@@ -26,7 +26,6 @@ sequenceDiagram
     participant Agent as Agent (Python)
     participant Kafka
     participant Server as Server (Go)
-    participant Redis
     participant Postgres
 
     Agent->>Agent: generate_plan (valida items/amount)
@@ -38,22 +37,16 @@ sequenceDiagram
     end
 
     Kafka->>Server: Poll records (manual commit)
-    Server->>Redis: Lookup(plan_id) — cache opcional
-    alt cache prova DUPLICATE ou ABORTED
-        Redis-->>Server: pula o evento
-    else miss, cache atrasado ou Redis fora
-        Server->>Postgres: BEGIN + advisory lock(order_id)
-        Postgres-->>Server: estado do pedido (last_seq, status, plan_id)
-        alt APPLY (seq == last_seq + 1)
-            Server->>Postgres: order + outbox + drena pending_events consecutivos
-        else BUFFER (gap)
-            Server->>Postgres: INSERT pending_events
-        else DUPLICATE / DISCARD (abortado)
-            Note over Server,Postgres: nada a gravar
-        end
-        Server->>Postgres: COMMIT
-        Server->>Redis: Advance(plan_id, last_seq) — so apos o commit
+    Server->>Postgres: BEGIN + advisory lock(order_id)
+    Postgres-->>Server: estado do pedido (last_seq, status, plan_id)
+    alt APPLY (seq == last_seq + 1)
+        Server->>Postgres: order + outbox + drena pending_events consecutivos
+    else BUFFER (gap)
+        Server->>Postgres: INSERT pending_events
+    else DUPLICATE / DISCARD (abortado)
+        Note over Server,Postgres: nada a gravar
     end
+    Server->>Postgres: COMMIT
 
     alt erro transitorio (PG fora, timeout)
         Server->>Server: retry no lugar com backoff (nao avanca)
@@ -68,10 +61,8 @@ sequenceDiagram
 | Componente | Tech | Responsabilidade |
 |---|---|---|
 | **Agent** | Python 3.12, LangGraph, Pydantic | Gera planos de eventos com sequenciamento |
-| **Server** | Go 1.22, franz-go | Consome Kafka, valida sequencia, persiste |
-| **Redis** | Redis 7.2, Lua Script | Cache monotonico de progresso por plano (opcional) |
+| **Server** | Go 1.22, franz-go | Consome Kafka, decide cada passo numa transacao, entrega os efeitos pelo outbox |
 | **Postgres** | PostgreSQL 16 | Source of truth: sequencia, buffer de reordenacao, outbox |
-| **Consul** | Consul 1.22 | Service discovery + config dinamica CB |
 | **Kafka** | Apache Kafka 3.7 | Transporte com manual commit |
 | **Jaeger** | OTLP gRPC | Distributed tracing |
 | **Grafana** | Dashboards | Metricas e visualizacao de traces |
@@ -80,11 +71,10 @@ sequenceDiagram
 
 ## Garantias de Processamento
 
-O objetivo e *effectively-once*: cada evento altera o pedido e gera notificacao no outbox exatamente uma vez, em ordem, mesmo com reentrega, reordenacao e falhas.
+O que o projeto garante e *effectively-once*, nao *exactly-once* de ponta a ponta: cada evento altera o pedido e gera notificacao no outbox exatamente uma vez, em ordem, mesmo com reentrega, reordenacao e falhas. A entrega da notificacao ao mundo externo e *at-least-once*, com `Idempotency-Key` para o receptor deduplicar; exactly-once atraves de HTTP nao existe.
 
 1. **Postgres decide tudo numa transacao** (`internal/db`): um advisory lock por `order_id` serializa quem escreve no pedido, inclusive antes de a linha existir. Na mesma transacao o servico le o estado, decide (`internal/sequencing`), grava `orders` + `outbox` e drena os eventos consecutivos de `pending_events`. Se a transacao falha, nada muda em lugar nenhum.
-2. **Kafka com commit so do que foi resolvido**: um erro transitorio (Postgres fora, timeout) e retentado no lugar com backoff exponencial, sem pular o registro nem commitar depois dele. So vai para a DLQ o que nunca vai funcionar (JSON invalido, envelope invalido, dado rejeitado pelo banco, plano divergente), e o offset so e commitado depois do ack do broker.
-3. **Redis e cache, nao fonte de verdade**: o cache so e escrito depois do commit no Postgres, e o `advance_seq.lua` nunca faz o contador voltar. Por isso o cache pode ficar atras do banco, mas nunca a frente, e so e usado para *pular* duplicatas e eventos de planos abortados. Se o Redis perde os dados ou sai do ar, o servico continua (o cache e ignorado por 5s apos cada falha).
+2. **Kafka com commit so do que foi resolvido**: um erro transitorio (Postgres fora, timeout) e retentado no lugar com backoff exponencial, sem pular o registro nem commitar depois dele. So vai para a DLQ o que nunca vai funcionar (JSON invalido, envelope invalido, dado rejeitado pelo banco, plano divergente), e o offset so e commitado depois do ack do broker. Se o server morre, o Kafka reentrega o que nao foi commitado, e a decisao do passo 1 torna a reentrega inofensiva.
 
 | Situacao | Resultado |
 |---|---|
@@ -96,7 +86,7 @@ O objetivo e *effectively-once*: cada evento altera o pedido e gera notificacao 
 | `ABORT_PLAN` com pedido completo | ignorado (estado terminal) |
 | Evento de outro plano para o mesmo pedido | DLQ (`PLAN_MISMATCH`) |
 | JSON malformado ou envelope invalido | DLQ (`PARSE_ERROR` / `INVALID_EVENT`), a particao segue |
-| Redis fora do ar ou sem dados | processamento segue pelo Postgres |
+| Server morre no meio (SIGKILL) | o Kafka reentrega o que nao foi commitado; nada e aplicado nem notificado duas vezes |
 | Postgres fora do ar | retry no lugar; nada e commitado nem perdido |
 | Receptor de webhook com erro (5xx, 408, 429, timeout) | retry agendado no banco com backoff exponencial; a notificacao seguinte do mesmo pedido espera, os outros pedidos seguem |
 | Receptor rejeita a notificacao (outro 4xx) | dead-letter na hora, sem retry; as notificacoes seguintes do pedido continuam |
@@ -120,13 +110,12 @@ O server expoe `/metrics` na porta 8080. O Prometheus faz scrape a cada 5s, e o 
 
 | Metrica | Tipo | O que mede |
 |---|---|---|
-| `nexus_events_processed_total{kind, outcome}` | counter | Eventos resolvidos pelo consumer, por desfecho (`apply`, `duplicate`, `buffer`, `discard`, `plan_mismatch`, `tombstone`, `cache_duplicate`, `cache_aborted`) |
+| `nexus_events_processed_total{kind, outcome}` | counter | Eventos resolvidos pelo consumer, por desfecho (`apply`, `duplicate`, `buffer`, `discard`, `plan_mismatch`, `tombstone`) |
 | `nexus_events_drained_total` | counter | Eventos do buffer aplicados quando o antecessor chegou |
 | `nexus_dlq_messages_total{code}` | counter | Mensagens confirmadas pela DLQ, por codigo |
 | `nexus_consumer_retries_total` | counter | Falhas transitorias retentadas no lugar |
 | `nexus_event_settle_seconds` | histogram | Do primeiro processamento ate o evento ser resolvido, retries incluidos |
 | `nexus_consumer_lag{topic, partition}` | gauge | Registros atras do high watermark, apos cada lote |
-| `nexus_seq_cache_errors_total{op}` | counter | Falhas do cache Redis (cada uma desliga o cache por 5s) |
 | `nexus_webhook_deliveries_total{result}` | counter | Resultado de cada tentativa de entrega (`delivered`, `retry_scheduled`, `dead_max_attempts`, `dead_rejected`, `released`) |
 | `nexus_webhook_request_seconds` | histogram | Duracao das requisicoes de webhook |
 | `nexus_circuit_breaker_state` | gauge | 0 fechado, 1 semiaberto, 2 aberto |
@@ -189,7 +178,7 @@ cd server && POSTGRES_DSN="postgres://user:pass@localhost:5432/db?sslmode=disabl
 # Testes unitarios do Agent Python
 make agent-test
 
-# Demo E2E: envia 10 planos e valida Exactly-Once
+# Demo E2E: envia 10 planos e valida que cada evento foi aplicado e notificado uma vez
 make demo-e2e
 
 # Demo E2E com 100 planos
@@ -198,9 +187,9 @@ make demo-e2e PLANS=100
 # Agent com falhas simuladas + conferencia no Postgres e no webhook sink (requer `make chaos-deps`)
 make agent-e2e
 
-# Chaos tests: sequence gaps, Redis restart (sem reenvio), zombie events, mensagens envenenadas (DLQ)
-# e entrega de webhooks com receptor instavel
-# Requer `make chaos-deps` e acesso ao Docker (o cenario Redis derruba o container nexus-redis)
+# Chaos tests: sequence gaps, crash do server (SIGKILL no meio dos planos), zombie events,
+# mensagens envenenadas (DLQ) e entrega de webhooks com receptor instavel
+# Requer `make chaos-deps` e acesso ao Docker (o cenario de crash mata e reinicia o container nexus-server)
 make chaos-test
 ```
 
@@ -313,17 +302,17 @@ make agent-studio
 │   │   ├── runner.py        # Executa o grafo e publica cada evento ao ser gerado
 │   │   └── config.py
 │   └── tests/               # pytest (unit tests)
-├── server/                  # Server Go (Event Processor)
+├── server/                  # Server Go (gateway)
 │   ├── cmd/server/          # Entrypoint
 │   ├── internal/
 │   │   ├── consumer/        # Kafka consumer (retry, commit, DLQ)
 │   │   ├── sequencing/      # Regras puras de ordenacao (sem I/O)
-│   │   ├── redis/           # Cache de sequencia + Lua loader
-│   │   ├── db/              # Postgres repository (transacao de sequencia)
+│   │   ├── db/              # Postgres repository (transacao de sequencia, outbox)
+│   │   ├── dispatcher/      # Entrega do outbox como webhooks (ordem por pedido, circuit breaker)
+│   │   ├── metrics/         # Metricas Prometheus
 │   │   ├── dlq/             # Dead Letter Queue producer
 │   │   └── telemetry/       # OpenTelemetry setup
-│   ├── pkg/models/          # Shared models
-│   └── scripts/lua/         # advance_seq.lua
+│   └── pkg/models/          # Shared models
 ├── scripts/
 │   ├── chaos_test.py        # Chaos testing scenarios
 │   ├── e2e_demo.py          # Demo E2E com validacao
@@ -354,7 +343,7 @@ make help  # Lista todos os comandos disponiveis
 | `make agent-e2e` | `agent-simulate` + conferencia no Postgres e no webhook sink |
 | `make server-test` | Testes Go (sem infra) |
 | `make agent-test` | Testes unitarios Python |
-| `make demo-e2e` | Demo E2E Exactly-Once |
+| `make demo-e2e` | Demo E2E: cada evento aplicado e notificado uma vez |
 | `make chaos-test` | Chaos tests completos |
 | `make webhook-stats` | Entregas recebidas pelo webhook sink, por pedido |
 | `make metrics` | Metricas `nexus_*` expostas pelo server |
@@ -375,3 +364,11 @@ make help  # Lista todos os comandos disponiveis
 | 9 | Entrega de webhooks (ADR-005) | Completa |
 | 10 | Metricas com Prometheus (ADR-006) | Completa |
 | 11 | Agent com falhas simuladas | Completa |
+| 12 | Tese e modelo de falhas (ADR-007); remocao de Redis e Consul (ADR-008) | Completa |
+| 13 | O gateway nao confia no agente: transicoes validas, estados finais, checagens de valor | Planejada |
+| 14 | Ciclo de vida do plano: consulta de estado, troca de plano, prazo | Planejada |
+| 15 | Efeitos executados pelo gateway e agente reativo com compensacao | Planejada |
+| 16 | Planner com LLM (OpenRouter) e relatorio de acoes bloqueadas | Planejada |
+| 17 | Numeros (benchmark) e narrativa final | Planejada |
+
+As fases 1, 3 e 4 usavam Redis e Consul, removidos na fase 12 (ADR-008).

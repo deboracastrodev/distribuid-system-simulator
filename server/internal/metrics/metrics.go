@@ -14,9 +14,8 @@ const namespace = "nexus"
 // with value 0, so dashboards and alerts see "0" instead of "no data".
 var (
 	eventKinds     = []string{"sequenced", "abort"}
-	eventOutcomes  = []string{"apply", "duplicate", "buffer", "discard", "plan_mismatch", "tombstone", "cache_duplicate", "cache_aborted"}
+	eventOutcomes  = []string{"apply", "duplicate", "buffer", "discard", "plan_mismatch", "tombstone"}
 	dlqCodes       = []string{"PARSE_ERROR", "INVALID_EVENT", "DB_REJECTED", "PLAN_MISMATCH", "BUFFER_TIMEOUT"}
-	cacheOps       = []string{"lookup", "advance", "mark-aborted"}
 	webhookResults = []string{"delivered", "retry_scheduled", "dead_max_attempts", "dead_rejected", "released"}
 	cbStates       = []string{"closed", "half-open", "open"}
 )
@@ -36,7 +35,6 @@ type Metrics struct {
 	ConsumerRetries    prometheus.Counter
 	EventSettleSeconds prometheus.Histogram
 	ConsumerLag        *prometheus.GaugeVec
-	SeqCacheErrors     *prometheus.CounterVec
 
 	// Outbox dispatcher
 	WebhookDeliveries         *prometheus.CounterVec
@@ -73,10 +71,6 @@ func New(reg prometheus.Registerer) *Metrics {
 			Namespace: namespace, Name: "consumer_lag",
 			Help: "Records behind the partition high watermark, measured after each processed batch.",
 		}, []string{"topic", "partition"}),
-		SeqCacheErrors: f.NewCounterVec(prometheus.CounterOpts{
-			Namespace: namespace, Name: "seq_cache_errors_total",
-			Help: "Failures of the Redis sequence cache; each one bypasses the cache for a cooldown.",
-		}, []string{"op"}),
 		WebhookDeliveries: f.NewCounterVec(prometheus.CounterOpts{
 			Namespace: namespace, Name: "webhook_deliveries_total",
 			Help: "Outcome of each outbox webhook delivery attempt.",
@@ -103,9 +97,6 @@ func New(reg prometheus.Registerer) *Metrics {
 	}
 	for _, code := range dlqCodes {
 		m.DLQMessages.WithLabelValues(code)
-	}
-	for _, op := range cacheOps {
-		m.SeqCacheErrors.WithLabelValues(op)
 	}
 	for _, result := range webhookResults {
 		m.WebhookDeliveries.WithLabelValues(result)

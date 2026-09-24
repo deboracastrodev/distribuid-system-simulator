@@ -92,3 +92,40 @@ Decisoes tecnologicas baseadas nos ADRs registrados em `docs/blueprint-arquitetu
 - [x] **Task 11.4:** Gerador de carga (`--orders N`) com relatorio JSON por plano (`--report`).
 - [x] **Task 11.5:** `scripts/check_agent_outcomes.py` no CI: 40 planos do agent (imagem do compose) conferidos no Postgres, no outbox e no webhook sink.
 - [x] **Task 11.6:** Logs do agent: o filtro que injeta `trace_id` estava no logger raiz, que nao filtra records de loggers filhos; toda linha de log falhava com `KeyError: 'otelTraceID'`. O filtro passou para o handler.
+
+## 🧭 Fase 12: Tese e Modelo de Falhas (ADR-007, ADR-008)
+
+- [x] **Task 12.1:** ADR-007: o projeto passa a ser um gateway de execucao segura de planos de agentes de IA. Catalogo de falhas de agente (F1–F14) com o estado atual de cada uma, o que o gateway garante e o que nao garante, e o roteiro das fases 13 a 17.
+- [x] **Task 12.2:** Corrigir o termo *exactly-once* no README e no blueprint: aplicado uma vez no Postgres (*effectively-once*), entregue pelo menos uma vez ao mundo externo, com `Idempotency-Key`.
+- [x] **Task 12.3:** Remover o Redis (ADR-008): consumer consulta so o Postgres; saem `internal/redis`, `advance_seq.lua`, a metrica `nexus_seq_cache_errors_total` e os desfechos `cache_*`.
+- [x] **Task 12.4:** Remover o Consul (ADR-008): circuit breaker configurado por variaveis de ambiente validadas no startup (`WEBHOOK_CB_*`, `WEBHOOK_TIMEOUT`); servicos pelo nome do compose.
+- [x] **Task 12.5:** Cenario de chaos "Server Crash" no lugar de "Redis Restart": com um advisory lock segurando o ultimo evento do lote, o server e morto com eventos aplicados e sem commit no Kafka. O cenario exige a reentrega (eventos ignorados como duplicados) e nenhuma notificacao duplicada; com a deduplicacao desligada, acusa 20 duplicatas.
+- [x] **Task 12.6:** `scripts/check_metrics.py` confere os contadores pelo Prometheus (`increase()`), que trata o reinicio do server no cenario de crash.
+
+## 🛡️ Fase 13: O Gateway Nao Confia no Agente (planejada)
+
+- [ ] **Task 13.1:** Definicao do processo no server: evento valido para cada estado; `completed` e `aborted` sao finais (F7, F8).
+- [ ] **Task 13.2:** Checagens de valor no server: itens nao vazios, total dentro do limite, pagamento igual ao total (F9).
+- [ ] **Task 13.3:** Violacao aborta o pedido com `policy_violation` e notifica; metrica de acoes bloqueadas por motivo.
+- [ ] **Task 13.4:** Agente adversarial no CI: comete cada violacao; nenhuma chega ao webhook.
+
+## ⏳ Fase 14: Ciclo de Vida do Plano (planejada)
+
+- [ ] **Task 14.1:** `GET /orders/{id}` com status, `plan_id` e `last_seq`, para o agent retomar em vez de recomecar (F10, F12).
+- [ ] **Task 14.2:** Troca explicita de plano: o plano novo substitui o antigo; eventos atrasados do antigo sao descartados (F10).
+- [ ] **Task 14.3:** Prazo do plano: pedido parado alem do prazo vira `failed` e notifica (F11).
+
+## 🔁 Fase 15: Efeitos Executados pelo Gateway (planejada)
+
+- [ ] **Task 15.1:** Servicos simulados de estoque e pagamento chamados pelo outbox com `Idempotency-Key`; resultados publicados em `order-results`. As taxas de falha saem do agent (F13).
+- [ ] **Task 15.2:** Agente reativo: espera o resultado de cada passo; compensa (estorno) quando uma falha acontece depois do pagamento.
+
+## 🤖 Fase 16: Planner com LLM (planejada)
+
+- [ ] **Task 16.1:** Planner com LLM via OpenRouter (tool use com os passos do processo), opcional; o deterministico continua o padrao do CI.
+- [ ] **Task 16.2:** Relatorio de acoes propostas, aplicadas e bloqueadas por motivo, incluindo um cenario com instrucao adversarial; job noturno quando a chave estiver configurada (F14).
+
+## 📏 Fase 17: Numeros e Narrativa (planejada)
+
+- [ ] **Task 17.1:** Benchmark: vazao, latencia p50/p99 por passo, custo do lock em pedido disputado.
+- [ ] **Task 17.2:** Painel de acoes bloqueadas no Grafana, `make demo` e texto final (problema, garantias, prova, custo, limites).

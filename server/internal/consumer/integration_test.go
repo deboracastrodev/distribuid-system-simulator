@@ -5,25 +5,22 @@ import (
 	"sync/atomic"
 	"testing"
 
-	"github.com/alicebob/miniredis/v2"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"github.com/twmb/franz-go/pkg/kgo"
 
 	"github.com/user/nexus-server/internal/db"
-	redisc "github.com/user/nexus-server/internal/redis"
 	"github.com/user/nexus-server/internal/testutil/pgtest"
 	"github.com/user/nexus-server/pkg/models"
 )
 
-// These tests run the consumer against real Postgres and a real Redis protocol
-// (miniredis). They skip when POSTGRES_DSN is not set.
+// These tests run the consumer against real Postgres. They skip when
+// POSTGRES_DSN is not set.
 
 type env struct {
 	consumer *Consumer
 	pool     *pgxpool.Pool
-	redis    *miniredis.Miniredis
 	dlq      *fakeDLQ
 }
 
@@ -40,17 +37,12 @@ func newEnv(t *testing.T, wrap func(Store) Store) *env {
 	require.NoError(t, err)
 	t.Cleanup(pool.Close)
 
-	mr := miniredis.RunT(t)
-	cache, err := redisc.New(mr.Addr(), "", "../../scripts/lua/advance_seq.lua")
-	require.NoError(t, err)
-	t.Cleanup(func() { cache.Close() })
-
 	var store Store = repo
 	if wrap != nil {
 		store = wrap(repo)
 	}
 	dlq := &fakeDLQ{}
-	return &env{consumer: newTestConsumer(store, cache, dlq), pool: pool, redis: mr, dlq: dlq}
+	return &env{consumer: newTestConsumer(store, dlq), pool: pool, dlq: dlq}
 }
 
 func (e *env) process(t *testing.T, records ...*kgo.Record) {
@@ -119,36 +111,12 @@ func TestIntegration_RedeliveryAfterCrashIsIdempotent(t *testing.T) {
 	p := newPlan()
 
 	// A crash before the commit makes Kafka redeliver the whole batch.
-	for i := 0; i < 2; i++ {
+	for i := 0; i < 3; i++ {
 		for seq := 1; seq <= 5; seq++ {
 			e.process(t, p.record(t, seq))
 		}
 	}
-	// And once more with the cache gone, so Postgres has to deduplicate alone.
-	e.redis.FlushAll()
-	for seq := 1; seq <= 5; seq++ {
-		e.process(t, p.record(t, seq))
-	}
 
-	assert.Equal(t, eventTypes, e.outbox(t, p.orderID))
-}
-
-// The old design kept sequence state only in Redis: after a restart every
-// in-flight plan stalled and its events expired to the DLQ an hour later.
-func TestIntegration_CacheLossDoesNotStallOrders(t *testing.T) {
-	e := newEnv(t, nil)
-	p := newPlan()
-	e.process(t, p.record(t, 1), p.record(t, 2))
-
-	e.redis.FlushAll() // restart without persistence
-	e.process(t, p.record(t, 3))
-
-	e.redis.Close() // outage
-	e.process(t, p.record(t, 4), p.record(t, 5))
-
-	status, lastSeq := e.order(t, p.orderID)
-	assert.Equal(t, "completed", status)
-	assert.Equal(t, 5, lastSeq)
 	assert.Equal(t, eventTypes, e.outbox(t, p.orderID))
 }
 

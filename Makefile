@@ -1,4 +1,4 @@
-.PHONY: help up down down-clean restart status logs validate wait agent-build agent-run agent-dry-run agent-abort-test agent-simulate agent-check agent-e2e chaos-test chaos-test-gaps chaos-test-redis chaos-test-zombie chaos-test-poison chaos-test-webhook webhook-stats metrics metrics-check prometheus-open grafana-open jaeger-open
+.PHONY: help up down down-clean restart status logs validate wait agent-build agent-run agent-dry-run agent-simulate agent-check agent-e2e chaos-test chaos-test-gaps chaos-test-crash chaos-test-zombie chaos-test-poison chaos-test-webhook webhook-stats metrics metrics-check prometheus-open grafana-open jaeger-open
 
 help: ## Exibe esta ajuda
 	@grep -E '^[a-zA-Z_%-]+:.*?## .*$$' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-15s\033[0m %s\n", $$1, $$2}'
@@ -20,7 +20,7 @@ status: ## Mostra status dos containers
 logs: ## Segue logs de todos os containers
 	@docker compose logs -f
 
-logs-%: ## Segue logs de um serviço (ex: make logs-kafka, make logs-consul)
+logs-%: ## Segue logs de um serviço (ex: make logs-kafka, make logs-server)
 	@docker compose logs -f $*
 
 validate: ## Valida conectividade com todos os serviços
@@ -91,12 +91,6 @@ server-lint: ## Roda o linter (golangci-lint se disponível)
 
 # --- Debug & Monitoring ---
 
-redis-cli: ## Acessa o Redis local
-	@docker compose exec redis redis-cli -a nexus_pass
-
-redis-monitor: ## Monitora comandos Redis em tempo real (veja o Script Lua rodando!)
-	@docker compose exec redis redis-cli -a nexus_pass monitor
-
 db-cli: ## Acessa o Postgres local
 	@docker compose exec postgres psql -U nexus_user -d nexus_db
 
@@ -117,26 +111,12 @@ demo-full: up ## Sobe infra e executa agent para gerar fluxo completo
 	@$(MAKE) agent-run
 	@echo "Fluxo gerado! Verifique logs com 'make server-logs' e banco com 'make db-check'"
 
-demo-e2e: ## Roda demo E2E: envia N planos e valida Exactly-Once (requer infra up)
+demo-e2e: ## Roda demo E2E: envia N planos e valida que cada evento foi aplicado e notificado uma vez (requer infra up)
 	@$(CHAOS_PYTHON) scripts/e2e_demo.py --plans $(or $(PLANS),10)
 
 db-check: ## Mostra estado atual dos pedidos no banco
 	@docker compose exec postgres psql -U nexus_user -d nexus_db -c "SELECT id, status, last_seq_processed, updated_at FROM orders ORDER BY updated_at DESC LIMIT 5;"
 	@docker compose exec postgres psql -U nexus_user -d nexus_db -c "SELECT id, event_type, processed, created_at FROM outbox ORDER BY created_at DESC LIMIT 5;"
-
-# --- Consul KV (Circuit Breaker Config) ---
-
-consul-kv-list: ## Lista todas as configs do Circuit Breaker no Consul KV
-	@curl -s http://localhost:8500/v1/kv/nexus/config/cb/?recurse | python3 -m json.tool 2>/dev/null || echo "No keys found"
-
-consul-kv-set: ## Altera config CB (ex: make consul-kv-set KEY=webhook_failure_threshold VAL=3)
-	@curl -s -X PUT -d '$(VAL)' http://localhost:8500/v1/kv/nexus/config/cb/$(KEY) && echo " OK: $(KEY)=$(VAL)"
-
-consul-kv-get: ## Lê config CB (ex: make consul-kv-get KEY=webhook_failure_threshold)
-	@curl -s http://localhost:8500/v1/kv/nexus/config/cb/$(KEY)?raw && echo ""
-
-consul-services: ## Lista serviços registrados no Consul
-	@curl -s http://localhost:8500/v1/agent/services | python3 -m json.tool
 
 # --- Observabilidade (Fase 5) ---
 
@@ -160,8 +140,8 @@ chaos-test: ## Roda todos os cenários de chaos test
 chaos-test-gaps: ## Roda apenas cenário de Sequence Gaps
 	@$(CHAOS_PYTHON) scripts/chaos_test.py --scenario gaps --orders 10
 
-chaos-test-redis: ## Roda apenas cenário de Redis Restart
-	@$(CHAOS_PYTHON) scripts/chaos_test.py --scenario redis --orders 10
+chaos-test-crash: ## Roda apenas cenário de crash do server (SIGKILL no meio dos planos)
+	@$(CHAOS_PYTHON) scripts/chaos_test.py --scenario crash --orders 10
 
 chaos-test-zombie: ## Roda apenas cenário de Zombie Events
 	@$(CHAOS_PYTHON) scripts/chaos_test.py --scenario zombie --orders 10

@@ -25,10 +25,6 @@ const (
 	retryBaseDelay = 200 * time.Millisecond
 	retryMaxDelay  = 10 * time.Second
 
-	// cacheCooldown is how long the seq cache is bypassed after it fails, so an
-	// outage costs one timeout per window instead of one per event.
-	cacheCooldown = 5 * time.Second
-
 	pendingSweepInterval = time.Minute
 	pendingSweepBatch    = 100
 
@@ -42,14 +38,6 @@ type Store interface {
 	ExpirePending(ctx context.Context, maxAge time.Duration, limit int, sink func(context.Context, *models.EventEnvelope) error) (int, error)
 }
 
-// SeqCache is a fast path in front of Store. It may lag behind Store but never
-// runs ahead of it, so it is trusted only to skip events, never to accept them.
-type SeqCache interface {
-	Lookup(ctx context.Context, planID string) (lastSeq int, aborted bool, err error)
-	Advance(ctx context.Context, planID string, seq int) error
-	MarkAborted(ctx context.Context, planID string) error
-}
-
 // DeadLetter receives events that can never be processed. A nil error means the
 // broker acknowledged the event.
 type DeadLetter interface {
@@ -60,17 +48,15 @@ type DeadLetter interface {
 type Consumer struct {
 	client  *kgo.Client
 	store   Store
-	cache   SeqCache
 	dlq     DeadLetter
 	metrics *metrics.Metrics
 
-	pendingTTL     time.Duration
-	retryBase      time.Duration
-	retryMax       time.Duration
-	cacheDownUntil time.Time // only touched by the Run goroutine
+	pendingTTL time.Duration
+	retryBase  time.Duration
+	retryMax   time.Duration
 }
 
-func New(brokers []string, topic, group string, pendingTTL time.Duration, store Store, cache SeqCache, dlq DeadLetter, m *metrics.Metrics) (*Consumer, error) {
+func New(brokers []string, topic, group string, pendingTTL time.Duration, store Store, dlq DeadLetter, m *metrics.Metrics) (*Consumer, error) {
 	client, err := kgo.NewClient(
 		kgo.SeedBrokers(brokers...),
 		kgo.ConsumerGroup(group),
@@ -81,15 +67,14 @@ func New(brokers []string, topic, group string, pendingTTL time.Duration, store 
 		return nil, err
 	}
 
-	c := newConsumer(store, cache, dlq, pendingTTL, m)
+	c := newConsumer(store, dlq, pendingTTL, m)
 	c.client = client
 	return c, nil
 }
 
-func newConsumer(store Store, cache SeqCache, dlq DeadLetter, pendingTTL time.Duration, m *metrics.Metrics) *Consumer {
+func newConsumer(store Store, dlq DeadLetter, pendingTTL time.Duration, m *metrics.Metrics) *Consumer {
 	return &Consumer{
 		store:      store,
-		cache:      cache,
 		dlq:        countingDLQ{next: dlq, metrics: m},
 		metrics:    m,
 		pendingTTL: pendingTTL,
@@ -249,11 +234,6 @@ func (c *Consumer) handleRecord(ctx context.Context, record *kgo.Record) error {
 
 func (c *Consumer) handleSequenced(ctx context.Context, event *models.EventEnvelope) error {
 	seq := *event.SeqID
-	if skipped := c.skipFromCache(ctx, event.PlanID, seq); skipped != "" {
-		c.metrics.EventsProcessed.WithLabelValues("sequenced", skipped).Inc()
-		return nil
-	}
-
 	res, err := c.persist(ctx, "postgres.apply-event", event, c.store.ApplyEvent)
 	if err != nil {
 		return c.handleStoreError(ctx, event, err)
@@ -271,15 +251,12 @@ func (c *Consumer) handleSequenced(ctx context.Context, event *models.EventEnvel
 	switch res.Outcome {
 	case sequencing.Apply:
 		slog.Info("event applied", "plan_id", event.PlanID, "seq_id", seq, "drained", res.Drained, "last_seq", res.LastSeq)
-		c.advanceCache(ctx, event.PlanID, res.LastSeq)
 	case sequencing.Duplicate:
 		slog.Info("duplicate event ignored", "plan_id", event.PlanID, "seq_id", seq)
-		c.advanceCache(ctx, event.PlanID, res.LastSeq)
 	case sequencing.Buffer:
 		slog.Info("out-of-order event buffered", "plan_id", event.PlanID, "seq_id", seq, "last_seq", res.LastSeq)
 	case sequencing.Discard:
 		slog.Info("event for aborted plan discarded", "plan_id", event.PlanID, "seq_id", seq)
-		c.markAbortedInCache(ctx, event.PlanID)
 	}
 	return nil
 }
@@ -299,7 +276,6 @@ func (c *Consumer) handleAbort(ctx context.Context, event *models.EventEnvelope)
 	switch res.Outcome {
 	case sequencing.Apply, sequencing.Tombstone, sequencing.Duplicate:
 		slog.Info("ABORT_PLAN processed", "plan_id", event.PlanID, "order_id", event.OrderID, "outcome", res.Outcome)
-		c.markAbortedInCache(ctx, event.PlanID)
 	case sequencing.Discard:
 		slog.Info("ABORT_PLAN ignored: order already completed", "plan_id", event.PlanID, "order_id", event.OrderID)
 	}
@@ -335,57 +311,6 @@ func (c *Consumer) handleStoreError(ctx context.Context, event *models.EventEnve
 		return c.dlq.Send(ctx, event, "rejected by database: "+err.Error(), "DB_REJECTED")
 	}
 	return fmt.Errorf("store: %w", err)
-}
-
-// skipFromCache reports why the cache alone proves the event needs no work
-// ("cache_aborted" or "cache_duplicate"), or "" when the Store must decide.
-// Any cache failure defers the decision to the Store.
-func (c *Consumer) skipFromCache(ctx context.Context, planID string, seq int) string {
-	if !c.cacheAvailable() {
-		return ""
-	}
-	lastSeq, aborted, err := c.cache.Lookup(ctx, planID)
-	if err != nil {
-		c.cacheFailed("lookup", err)
-		return ""
-	}
-	if aborted {
-		slog.Info("event for aborted plan discarded (cache)", "plan_id", planID, "seq_id", seq)
-		return "cache_aborted"
-	}
-	if seq <= lastSeq {
-		slog.Info("duplicate event ignored (cache)", "plan_id", planID, "seq_id", seq)
-		return "cache_duplicate"
-	}
-	return ""
-}
-
-func (c *Consumer) advanceCache(ctx context.Context, planID string, seq int) {
-	if !c.cacheAvailable() {
-		return
-	}
-	if err := c.cache.Advance(ctx, planID, seq); err != nil {
-		c.cacheFailed("advance", err)
-	}
-}
-
-func (c *Consumer) markAbortedInCache(ctx context.Context, planID string) {
-	if !c.cacheAvailable() {
-		return
-	}
-	if err := c.cache.MarkAborted(ctx, planID); err != nil {
-		c.cacheFailed("mark-aborted", err)
-	}
-}
-
-func (c *Consumer) cacheAvailable() bool {
-	return c.cache != nil && time.Now().After(c.cacheDownUntil)
-}
-
-func (c *Consumer) cacheFailed(op string, err error) {
-	c.metrics.SeqCacheErrors.WithLabelValues(op).Inc()
-	c.cacheDownUntil = time.Now().Add(cacheCooldown)
-	slog.Warn("seq cache unavailable, bypassing it", "op", op, "cooldown", cacheCooldown, "error", err)
 }
 
 // pendingSweeper sends events whose predecessor never arrived to the DLQ.

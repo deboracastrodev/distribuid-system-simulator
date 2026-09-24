@@ -42,36 +42,6 @@ func (s *fakeStore) ExpirePending(context.Context, time.Duration, int, func(cont
 	return 0, nil
 }
 
-type fakeCache struct {
-	lastSeq   int
-	aborted   bool
-	err       error
-	lookups   int
-	advanced  []int
-	abortMark int
-}
-
-func (c *fakeCache) Lookup(context.Context, string) (int, bool, error) {
-	c.lookups++
-	return c.lastSeq, c.aborted, c.err
-}
-
-func (c *fakeCache) Advance(_ context.Context, _ string, seq int) error {
-	if c.err != nil {
-		return c.err
-	}
-	c.advanced = append(c.advanced, seq)
-	return nil
-}
-
-func (c *fakeCache) MarkAborted(context.Context, string) error {
-	if c.err != nil {
-		return c.err
-	}
-	c.abortMark++
-	return nil
-}
-
 type fakeDLQ struct {
 	err   error
 	codes []string
@@ -137,8 +107,8 @@ func applied(lastSeq int) func(*models.EventEnvelope) (db.Result, error) {
 	}
 }
 
-func newTestConsumer(store Store, cache SeqCache, dlq DeadLetter) *Consumer {
-	c := newConsumer(store, cache, dlq, time.Hour, metrics.NewForTest())
+func newTestConsumer(store Store, dlq DeadLetter) *Consumer {
+	c := newConsumer(store, dlq, time.Hour, metrics.NewForTest())
 	c.retryBase = time.Millisecond
 	c.retryMax = 5 * time.Millisecond
 	return c
@@ -158,14 +128,13 @@ func dlqCount(c *Consumer, code string) float64 {
 
 func TestHandleRecord_TransientStoreErrorIsNotSettled(t *testing.T) {
 	store := &fakeStore{apply: func(*models.EventEnvelope) (db.Result, error) { return db.Result{}, errConnReset }}
-	cache, dlq := &fakeCache{}, &fakeDLQ{}
-	c := newTestConsumer(store, cache, dlq)
+	dlq := &fakeDLQ{}
+	c := newTestConsumer(store, dlq)
 
 	err := c.handleRecord(context.Background(), newPlan().record(t, 2))
 
 	assert.ErrorIs(t, err, errConnReset)
 	assert.Empty(t, dlq.codes, "a transient failure is retried, not dead-lettered")
-	assert.Empty(t, cache.advanced, "the cache must never run ahead of Postgres")
 	assert.Zero(t, events(c, "sequenced", "apply"), "an unsettled event is not counted")
 }
 
@@ -174,7 +143,7 @@ func TestHandleRecord_PermanentStoreErrorGoesToDLQ(t *testing.T) {
 		return db.Result{}, &pgconn.PgError{Code: "22003", Message: "numeric field overflow"}
 	}}
 	dlq := &fakeDLQ{}
-	c := newTestConsumer(store, &fakeCache{}, dlq)
+	c := newTestConsumer(store, dlq)
 
 	require.NoError(t, c.handleRecord(context.Background(), newPlan().record(t, 1)))
 	assert.Equal(t, []string{"DB_REJECTED"}, dlq.codes)
@@ -183,7 +152,7 @@ func TestHandleRecord_PermanentStoreErrorGoesToDLQ(t *testing.T) {
 
 func TestHandleRecord_UnacknowledgedDLQSendIsNotSettled(t *testing.T) {
 	dlq := &fakeDLQ{err: errors.New("broker unavailable")}
-	c := newTestConsumer(&fakeStore{}, &fakeCache{}, dlq)
+	c := newTestConsumer(&fakeStore{}, dlq)
 
 	err := c.handleRecord(context.Background(), &kgo.Record{Value: []byte("{not json")})
 
@@ -205,7 +174,7 @@ func TestHandleRecord_UnprocessableEventsGoToDLQ(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			store, dlq := &fakeStore{}, &fakeDLQ{}
-			c := newTestConsumer(store, &fakeCache{}, dlq)
+			c := newTestConsumer(store, dlq)
 
 			require.NoError(t, c.handleRecord(context.Background(), tt.record))
 			assert.Equal(t, []string{tt.code}, dlq.codes)
@@ -220,7 +189,7 @@ func TestHandleRecord_PlanMismatchGoesToDLQ(t *testing.T) {
 		return db.Result{Outcome: sequencing.PlanMismatch}, nil
 	}}
 	dlq := &fakeDLQ{}
-	c := newTestConsumer(store, &fakeCache{}, dlq)
+	c := newTestConsumer(store, dlq)
 
 	require.NoError(t, c.handleRecord(context.Background(), newPlan().record(t, 2)))
 	assert.Equal(t, []string{"PLAN_MISMATCH"}, dlq.codes)
@@ -228,86 +197,15 @@ func TestHandleRecord_PlanMismatchGoesToDLQ(t *testing.T) {
 	assert.Equal(t, float64(1), events(c, "sequenced", "plan_mismatch"))
 }
 
-// --- cache: trusted only to skip work ---
-
-func TestHandleRecord_CacheAdvancesToLastSeqAfterCommit(t *testing.T) {
+func TestHandleRecord_AppliedEventCountsDrainedSuccessors(t *testing.T) {
 	store := &fakeStore{apply: func(*models.EventEnvelope) (db.Result, error) {
 		return db.Result{Outcome: sequencing.Apply, LastSeq: 4, Drained: 2}, nil
 	}}
-	cache := &fakeCache{lastSeq: 1}
-	c := newTestConsumer(store, cache, &fakeDLQ{})
+	c := newTestConsumer(store, &fakeDLQ{})
 
 	require.NoError(t, c.handleRecord(context.Background(), newPlan().record(t, 2)))
-	assert.Equal(t, []int{4}, cache.advanced, "drained events count too")
 	assert.Equal(t, float64(1), events(c, "sequenced", "apply"))
 	assert.Equal(t, float64(2), testutil.ToFloat64(c.metrics.EventsDrained))
-}
-
-func TestHandleRecord_BufferedEventDoesNotAdvanceCache(t *testing.T) {
-	store := &fakeStore{apply: func(*models.EventEnvelope) (db.Result, error) {
-		return db.Result{Outcome: sequencing.Buffer, LastSeq: 1}, nil
-	}}
-	cache := &fakeCache{lastSeq: 1}
-	c := newTestConsumer(store, cache, &fakeDLQ{})
-
-	require.NoError(t, c.handleRecord(context.Background(), newPlan().record(t, 3)))
-	assert.Empty(t, cache.advanced)
-}
-
-func TestHandleRecord_CacheHitSkipsStore(t *testing.T) {
-	tests := []struct {
-		name    string
-		cache   *fakeCache
-		outcome string
-	}{
-		{"already committed", &fakeCache{lastSeq: 3}, "cache_duplicate"},
-		{"plan aborted", &fakeCache{aborted: true}, "cache_aborted"},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			store := &fakeStore{apply: applied(3)}
-			c := newTestConsumer(store, tt.cache, &fakeDLQ{})
-
-			require.NoError(t, c.handleRecord(context.Background(), newPlan().record(t, 2)))
-			assert.Zero(t, store.applied)
-			assert.Equal(t, float64(1), events(c, "sequenced", tt.outcome))
-		})
-	}
-}
-
-func TestHandleRecord_CacheMissFallsThroughToStore(t *testing.T) {
-	store := &fakeStore{apply: applied(3)}
-	c := newTestConsumer(store, &fakeCache{lastSeq: 2}, &fakeDLQ{})
-
-	require.NoError(t, c.handleRecord(context.Background(), newPlan().record(t, 3)))
-	assert.Equal(t, 1, store.applied)
-}
-
-func TestHandleRecord_CacheOutageFallsBackToStoreAndBacksOff(t *testing.T) {
-	store := &fakeStore{apply: applied(1)}
-	cache := &fakeCache{err: errors.New("dial tcp: connection refused")}
-	c := newTestConsumer(store, cache, &fakeDLQ{})
-	p := newPlan()
-
-	require.NoError(t, c.handleRecord(context.Background(), p.record(t, 1)))
-	require.NoError(t, c.handleRecord(context.Background(), p.record(t, 2)))
-
-	assert.Equal(t, 2, store.applied, "events keep flowing without the cache")
-	assert.Equal(t, 1, cache.lookups, "the cache is bypassed during the cooldown")
-	assert.Equal(t, float64(1), testutil.ToFloat64(c.metrics.SeqCacheErrors.WithLabelValues("lookup")))
-}
-
-func TestHandleRecord_AbortMarksCache(t *testing.T) {
-	for _, outcome := range []sequencing.Outcome{sequencing.Apply, sequencing.Tombstone, sequencing.Duplicate} {
-		t.Run(string(outcome), func(t *testing.T) {
-			store := &fakeStore{abort: func(*models.EventEnvelope) (db.Result, error) { return db.Result{Outcome: outcome}, nil }}
-			cache := &fakeCache{}
-			c := newTestConsumer(store, cache, &fakeDLQ{})
-
-			require.NoError(t, c.handleRecord(context.Background(), newPlan().abortRecord(t)))
-			assert.Equal(t, 1, cache.abortMark)
-		})
-	}
 }
 
 // --- retry loop ---
@@ -322,7 +220,7 @@ func TestProcessWithRetry_RetriesTransientFailureInPlace(t *testing.T) {
 		return db.Result{Outcome: sequencing.Apply, LastSeq: 1}, nil
 	}}
 	dlq := &fakeDLQ{}
-	c := newTestConsumer(store, &fakeCache{}, dlq)
+	c := newTestConsumer(store, dlq)
 
 	require.NoError(t, c.processWithRetry(context.Background(), newPlan().record(t, 1)))
 	assert.Equal(t, 3, store.applied)
@@ -336,7 +234,7 @@ func TestProcessWithRetry_RetriesTransientFailureInPlace(t *testing.T) {
 
 func TestProcessWithRetry_StopsWhenContextIsCancelled(t *testing.T) {
 	store := &fakeStore{apply: func(*models.EventEnvelope) (db.Result, error) { return db.Result{}, errConnReset }}
-	c := newTestConsumer(store, &fakeCache{}, &fakeDLQ{})
+	c := newTestConsumer(store, &fakeDLQ{})
 
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Millisecond)
 	defer cancel()

@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Chaos Test - Validação de Exactly-Once e resiliência do Nexus Event Gateway.
+"""Chaos Test - Validação das garantias e da resiliência do Nexus Event Gateway.
 
-Oráculo: envia N pedidos via Kafka, introduz caos (sequence gaps, Redis restart,
-mensagens envenenadas, falhas no receptor de webhooks),
+Oráculo: envia N pedidos via Kafka, introduz caos (sequence gaps, crash do server,
+eventos zumbis, mensagens envenenadas, falhas no receptor de webhooks),
 e valida que o Postgres tem exatamente os registros esperados com status correto.
 
 Requisitos:
@@ -11,7 +11,7 @@ Requisitos:
 Uso:
     python scripts/chaos_test.py                  # Roda todos os cenários
     python scripts/chaos_test.py --scenario gaps  # Apenas sequence gaps
-    python scripts/chaos_test.py --scenario redis # Apenas Redis restart
+    python scripts/chaos_test.py --scenario crash # Apenas crash do server (SIGKILL)
     python scripts/chaos_test.py --scenario poison # Apenas mensagens envenenadas (DLQ)
     python scripts/chaos_test.py --scenario webhook # Apenas entrega de webhooks (outbox)
     python scripts/chaos_test.py --orders 50      # 50 pedidos por cenário
@@ -50,8 +50,8 @@ POSTGRES_DSN = os.getenv(
     "dbname=nexus_db user=nexus_user password=nexus_pass host=localhost port=5432",
 )
 WEBHOOK_SINK_URL = os.getenv("WEBHOOK_SINK_URL", "http://localhost:9090")
-DOCKER_REDIS_CONTAINER = os.getenv("REDIS_CONTAINER", "nexus-redis")
 DOCKER_SERVER_CONTAINER = os.getenv("SERVER_CONTAINER", "nexus-server")
+SERVER_METRICS_URL = os.getenv("SERVER_METRICS_URL", "http://localhost:8080/metrics")
 
 # Sequência completa de event types para um pedido happy-path
 EVENT_SEQUENCE = [
@@ -304,54 +304,93 @@ def _wait_for_completion(conn, plans: list[Plan], timeout: int) -> int:
     return completed
 
 
-def scenario_redis_restart(producer: Producer, conn, num_orders: int) -> ScenarioResult:
-    """Cenário: derruba o Redis no meio dos planos.
+def _server_duplicates() -> float:
+    """Eventos que o server ignorou como duplicados desde que subiu."""
+    with urllib.request.urlopen(SERVER_METRICS_URL, timeout=10) as resp:
+        for line in resp.read().decode().splitlines():
+            if line.startswith('nexus_events_processed_total{kind="sequenced",outcome="duplicate"}'):
+                return float(line.split()[-1])
+    return 0.0
 
-    Envia os 2 primeiros eventos de cada plano, derruba o Redis, envia os 3
-    restantes com o Redis fora e sobe o Redis de volta. Nada é reenviado: o
-    sistema precisa terminar todos os pedidos sozinho, com cada evento
-    aplicado exatamente uma vez.
+
+def _wait_blocked(conn, plans: list[Plan], timeout: int = 30) -> bool:
+    """Espera os planos terem seq 2 aplicado e o server parado esperando o lock."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT COUNT(*) FROM orders WHERE plan_id = ANY(%s) AND last_seq_processed = 2",
+                ([p.plan_id for p in plans],),
+            )
+            applied = cur.fetchone()[0]
+            cur.execute("SELECT COUNT(*) FROM pg_locks WHERE locktype = 'advisory' AND NOT granted")
+            waiting = cur.fetchone()[0]
+        if applied == len(plans) and waiting > 0:
+            return True
+        time.sleep(0.2)
+    return False
+
+
+def scenario_server_crash(producer: Producer, conn, num_orders: int) -> ScenarioResult:
+    """Cenário: mata o server (SIGKILL) com eventos aplicados e não commitados.
+
+    O consumer só commita o offset no fim de cada lote. O teste segura, numa
+    transação própria, o advisory lock de um pedido "bloqueador" e publica num
+    único lote os eventos 1 e 2 de cada plano e, por último, o evento 1 do
+    bloqueador. O server aplica os planos e trava no bloqueador, com o lote
+    ainda sem commit; então é morto. Ao voltar, o Kafka reentrega os eventos já
+    aplicados, e o server precisa ignorá-los como duplicados. Os eventos
+    restantes são publicados com o server fora do ar. Todos os pedidos precisam
+    terminar, com cada evento aplicado e notificado exatamente uma vez.
     """
-    name = "Redis Restart"
+    name = "Server Crash"
     logger.info("=== Cenário: %s (%d pedidos) ===", name, num_orders)
 
     _clean_db(conn)
     plans = [Plan() for _ in range(num_orders)]
-    docker_client = docker.from_env()
+    blocker = Plan()
+    try:
+        server = docker.from_env().containers.get(DOCKER_SERVER_CONTAINER)
+    except Exception as e:
+        return ScenarioResult(name, False, f"Container do server indisponível: {e}")
 
-    # Fase 1: primeiros 2 eventos de cada plano com o Redis de pé
-    for p in plans:
+    lock_conn = psycopg2.connect(POSTGRES_DSN)
+    try:
+        with lock_conn.cursor() as cur:
+            cur.execute("SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))", (blocker.order_id,))
+
+        # Fase 1: um único lote (linger) para o server receber tudo num fetch só
+        batch_producer = Producer({"bootstrap.servers": KAFKA_BOOTSTRAP, "linger.ms": 500})
+        _produce(batch_producer, [
+            _make_event(p.plan_id, p.order_id, EVENT_SEQUENCE[i], i + 1)
+            for p in plans for i in range(2)
+        ] + [_make_event(blocker.plan_id, blocker.order_id, EVENT_SEQUENCE[0], 1)])
+
+        if not _wait_blocked(conn, plans):
+            return ScenarioResult(name, False, "O server não aplicou os planos nem travou no bloqueador")
+        logger.info("Planos aplicados e lote sem commit: matando o server (SIGKILL)...")
+        server.kill()
+    finally:
+        lock_conn.rollback()
+        lock_conn.close()
+
+    # Fase 2: eventos restantes com o server fora do ar
+    try:
         _produce(producer, [
             _make_event(p.plan_id, p.order_id, EVENT_SEQUENCE[i], i + 1)
-            for i in range(2)
+            for p in plans for i in range(2, 5)
+        ] + [
+            _make_event(blocker.plan_id, blocker.order_id, EVENT_SEQUENCE[i], i + 1)
+            for i in range(1, 5)
         ])
-
-    logger.info("Fase 1: primeiros eventos enviados, aguardando processamento (3s)...")
-    time.sleep(3)
-
-    # Fase 2: derrubar Redis
-    try:
-        redis_container = docker_client.containers.get(DOCKER_REDIS_CONTAINER)
-        logger.info("Derrubando Redis...")
-        redis_container.stop(timeout=2)
-    except Exception as e:
-        return ScenarioResult(name, False, f"Falha ao derrubar Redis: {e}")
-
-    # Fase 3: eventos restantes com o Redis fora do ar
-    try:
-        for p in plans:
-            _produce(producer, [
-                _make_event(p.plan_id, p.order_id, EVENT_SEQUENCE[i], i + 1)
-                for i in range(2, 5)
-            ])
-        logger.info("Fase 3: eventos enviados com Redis offline, aguardando (3s)...")
-        time.sleep(3)
     finally:
-        # Fase 4: subir Redis de volta mesmo se a fase 3 falhar
-        redis_container.start()
-        logger.info("Redis reiniciado")
+        # Fase 3: subir o server de volta mesmo se a fase 2 falhar
+        server.start()
+        logger.info("Server reiniciado")
+    plans.append(blocker)
 
-    completed = _wait_for_completion(conn, plans, timeout=45)
+    # O grupo só rebalanceia quando a sessão do consumidor morto expira.
+    completed = _wait_for_completion(conn, plans, timeout=120)
 
     with conn.cursor() as cur:
         # Cada evento deve gerar exatamente uma notificação no outbox
@@ -376,20 +415,27 @@ def scenario_redis_restart(producer: Producer, conn, num_orders: int) -> Scenari
             name, False,
             f"DUPLICATAS no outbox: {len(duplicates)} eventos notificados mais de uma vez. Ex: {duplicates[:3]}"
         )
-    if completed != num_orders:
+    if completed != len(plans):
         return ScenarioResult(
             name, False,
-            f"Apenas {completed}/{num_orders} pedidos 'completed' com seq=5 (sem reenvio)"
+            f"Apenas {completed}/{len(plans)} pedidos 'completed' com seq=5 (sem reenvio)"
         )
-    if notifications != num_orders * len(EVENT_SEQUENCE):
+    if notifications != len(plans) * len(EVENT_SEQUENCE):
         return ScenarioResult(
             name, False,
-            f"{notifications} notificações no outbox, esperado {num_orders * len(EVENT_SEQUENCE)}"
+            f"{notifications} notificações no outbox, esperado {len(plans) * len(EVENT_SEQUENCE)}"
+        )
+    redelivered = _server_duplicates()
+    if redelivered == 0:
+        return ScenarioResult(
+            name, False,
+            "Nenhum evento reentregue após o crash: o cenário não exercitou a reentrega"
         )
 
     return ScenarioResult(
         name, True,
-        f"{num_orders} pedidos 'completed' com seq=5 sem reenvio, "
+        f"{len(plans)} pedidos 'completed' com seq=5 após SIGKILL no server; "
+        f"{redelivered:.0f} eventos já aplicados foram reentregues e ignorados; "
         f"{notifications} notificações, 0 duplicatas"
     )
 
@@ -641,7 +687,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Nexus Chaos Test Suite")
     parser.add_argument(
         "--scenario",
-        choices=["gaps", "redis", "zombie", "poison", "webhook", "all"],
+        choices=["gaps", "crash", "zombie", "poison", "webhook", "all"],
         default="all",
         help="Cenário a executar (default: all)",
     )
@@ -676,7 +722,7 @@ def main() -> None:
 
     scenarios = {
         "gaps": scenario_sequence_gaps,
-        "redis": scenario_redis_restart,
+        "crash": scenario_server_crash,
         "zombie": scenario_zombie_events,
         "poison": scenario_poison_messages,
         "webhook": scenario_webhook_delivery,
