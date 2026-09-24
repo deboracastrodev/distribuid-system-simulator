@@ -24,6 +24,8 @@ from __future__ import annotations
 
 import json
 import os
+import signal
+import sys
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -153,5 +155,8 @@ class Handler(BaseHTTPRequestHandler):
 
 
 if __name__ == "__main__":
+    # Como PID 1 no container, o processo ignora SIGTERM sem um handler, e o
+    # `docker compose down` esperaria o timeout de 10s para matá-lo.
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
     print(f"webhook sink ouvindo na porta {PORT}", flush=True)
     ThreadingHTTPServer(("0.0.0.0", PORT), Handler).serve_forever()
