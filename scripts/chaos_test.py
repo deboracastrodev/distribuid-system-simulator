@@ -2,7 +2,7 @@
 """Chaos Test - Validação de Exactly-Once e resiliência do Nexus Event Gateway.
 
 Oráculo: envia N pedidos via Kafka, introduz caos (sequence gaps, Redis restart,
-mensagens envenenadas),
+mensagens envenenadas, falhas no receptor de webhooks),
 e valida que o Postgres tem exatamente os registros esperados com status correto.
 
 Requisitos:
@@ -13,6 +13,7 @@ Uso:
     python scripts/chaos_test.py --scenario gaps  # Apenas sequence gaps
     python scripts/chaos_test.py --scenario redis # Apenas Redis restart
     python scripts/chaos_test.py --scenario poison # Apenas mensagens envenenadas (DLQ)
+    python scripts/chaos_test.py --scenario webhook # Apenas entrega de webhooks (outbox)
     python scripts/chaos_test.py --orders 50      # 50 pedidos por cenário
 """
 
@@ -24,6 +25,7 @@ import logging
 import os
 import sys
 import time
+import urllib.request
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone, timedelta
@@ -47,6 +49,7 @@ POSTGRES_DSN = os.getenv(
     "POSTGRES_DSN",
     "dbname=nexus_db user=nexus_user password=nexus_pass host=localhost port=5432",
 )
+WEBHOOK_SINK_URL = os.getenv("WEBHOOK_SINK_URL", "http://localhost:9090")
 DOCKER_REDIS_CONTAINER = os.getenv("REDIS_CONTAINER", "nexus-redis")
 DOCKER_SERVER_CONTAINER = os.getenv("SERVER_CONTAINER", "nexus-server")
 
@@ -525,6 +528,112 @@ def scenario_poison_messages(producer: Producer, conn, num_orders: int) -> Scena
     )
 
 
+def _sink(path: str, body: dict | None = None) -> dict:
+    """Chama o receptor de webhooks (scripts/webhook_sink.py)."""
+    data = json.dumps(body).encode() if body is not None else None
+    req = urllib.request.Request(
+        WEBHOOK_SINK_URL + path,
+        data=data,
+        method="POST" if data is not None else "GET",
+        headers={"Content-Type": "application/json"},
+    )
+    with urllib.request.urlopen(req, timeout=5) as resp:
+        return json.loads(resp.read())
+
+
+def scenario_webhook_delivery(producer: Producer, conn, num_orders: int) -> ScenarioResult:
+    """Cenário: receptor de webhooks instável.
+
+    O receptor responde 503 a cada 3 requisições e rejeita (400) todas as
+    notificações de um pedido. As notificações dos demais pedidos devem chegar
+    todas, uma vez cada, em ordem e com Idempotency-Key; o pedido rejeitado
+    vai para dead-letter sem retry e não atrasa os outros.
+    """
+    name = "Webhook Delivery"
+    logger.info("=== Cenário: %s (%d pedidos) ===", name, num_orders)
+
+    _clean_db(conn)
+    plans = [Plan() for _ in range(num_orders)]
+    rejected = Plan()
+    _sink("/reset", {})
+    _sink("/control", {"fail_every": 3, "reject_aggregates": [rejected.order_id]})
+
+    try:
+        for p in plans + [rejected]:
+            _produce(producer, [
+                _make_event(p.plan_id, p.order_id, evt, seq)
+                for seq, evt in enumerate(EVENT_SEQUENCE, start=1)
+            ])
+
+        if _wait_for_completion(conn, plans + [rejected], timeout=45) != num_orders + 1:
+            return ScenarioResult(name, False, "Pedidos não completaram no Postgres")
+
+        expected = len(EVENT_SEQUENCE)
+        deadline = time.time() + 90
+        while time.time() < deadline:
+            aggs = _sink("/stats")["aggregates"]
+            done = [aggs.get(p.order_id, {}).get("accepted_unique", 0) for p in plans]
+            if all(n >= expected for n in done):
+                break
+            time.sleep(1)
+        aggs = _sink("/stats")["aggregates"]
+    finally:
+        _sink("/control", {})
+
+    problems = []
+    for p in plans:
+        a = aggs.get(p.order_id)
+        if a is None:
+            problems.append(f"{p.order_id}: nenhuma notificação recebida")
+            continue
+        if a["missing_key"]:
+            problems.append(f"{p.order_id}: {a['missing_key']} entregas sem Idempotency-Key")
+        if a["duplicates"]:
+            problems.append(f"{p.order_id}: {a['duplicates']} entregas duplicadas")
+        if a["out_of_order"]:
+            problems.append(f"{p.order_id}: fora de ordem {a['accepted_seqs']}")
+        if a["accepted_unique"] != expected:
+            problems.append(f"{p.order_id}: {a['accepted_unique']}/{expected} notificações")
+    if problems:
+        return ScenarioResult(name, False, f"{len(problems)} problemas. Ex: {problems[:3]}")
+
+    injected = sum(aggs[p.order_id]["failed_injected"] for p in plans)
+    if injected == 0:
+        return ScenarioResult(name, False, "Nenhuma falha injetada: o cenário não exercitou retry")
+
+    rejected_stats = aggs.get(rejected.order_id, {})
+    if rejected_stats.get("accepted", 0):
+        return ScenarioResult(name, False, "Pedido rejeitado teve notificações aceitas")
+    if rejected_stats.get("rejected", 0) != expected:
+        return ScenarioResult(
+            name, False,
+            f"Pedido rejeitado: {rejected_stats.get('rejected', 0)} tentativas, "
+            f"esperado {expected} (uma por notificação, sem retry de 4xx)"
+        )
+
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT COUNT(*) FROM outbox WHERE aggregate_id = %s AND dead_at IS NOT NULL AND attempts = 1",
+            (rejected.order_id,),
+        )
+        dead = cur.fetchone()[0]
+        cur.execute(
+            "SELECT COUNT(*) FROM outbox WHERE aggregate_id::text = ANY(%s) AND NOT processed",
+            ([p.order_id for p in plans],),
+        )
+        pending = cur.fetchone()[0]
+    if dead != expected:
+        return ScenarioResult(name, False, f"{dead}/{expected} notificações rejeitadas em dead-letter")
+    if pending:
+        return ScenarioResult(name, False, f"{pending} notificações entregues ainda pendentes no outbox")
+
+    return ScenarioResult(
+        name, True,
+        f"{num_orders * expected} notificações entregues uma vez e em ordem "
+        f"({injected} falhas 503 retentadas); pedido rejeitado em dead-letter sem retry"
+    )
+
+
 # --- Main ---
 
 
@@ -532,7 +641,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Nexus Chaos Test Suite")
     parser.add_argument(
         "--scenario",
-        choices=["gaps", "redis", "zombie", "poison", "all"],
+        choices=["gaps", "redis", "zombie", "poison", "webhook", "all"],
         default="all",
         help="Cenário a executar (default: all)",
     )
@@ -570,6 +679,7 @@ def main() -> None:
         "redis": scenario_redis_restart,
         "zombie": scenario_zombie_events,
         "poison": scenario_poison_messages,
+        "webhook": scenario_webhook_delivery,
     }
 
     to_run = list(scenarios.keys()) if args.scenario == "all" else [args.scenario]

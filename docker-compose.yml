@@ -103,6 +103,8 @@ services:
         condition: service_healthy
       consul:
         condition: service_healthy
+      webhook-sink:
+        condition: service_healthy
     dns:
       - 172.28.0.100
     dns_search:
@@ -118,12 +120,30 @@ services:
       CONSUL_ADDR: 172.28.0.100:8500
       OTEL_EXPORTER_OTLP_ENDPOINT: jaeger:4317
       OTEL_SERVICE_NAME: nexus-server
+      WEBHOOK_URL: http://webhook-sink:9090/webhook
     ports:
       - "8080:8080"
     healthcheck:
       test: ["CMD-SHELL", "wget -qO- http://localhost:8080/health || exit 1"]
       interval: 10s
       timeout: 5s
+      retries: 5
+    networks:
+      - nexus
+
+  # --- RECEPTOR DE WEBHOOKS (destino do dispatcher do outbox) ---
+  webhook-sink:
+    image: python:3.12-slim
+    container_name: nexus-webhook-sink
+    command: python /app/webhook_sink.py
+    volumes:
+      - ./scripts/webhook_sink.py:/app/webhook_sink.py:ro
+    ports:
+      - "9090:9090"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:9090/health')"]
+      interval: 5s
+      timeout: 3s
       retries: 5
     networks:
       - nexus

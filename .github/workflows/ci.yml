@@ -112,7 +112,7 @@ jobs:
       - name: E2E (50 planos)
         run: python scripts/e2e_demo.py --plans 50
 
-      - name: Chaos (gaps, Redis restart, zombies, mensagens envenenadas)
+      - name: Chaos (gaps, Redis restart, zombies, mensagens envenenadas, webhooks)
         run: python scripts/chaos_test.py --orders 10
 
       - name: Logs da stack

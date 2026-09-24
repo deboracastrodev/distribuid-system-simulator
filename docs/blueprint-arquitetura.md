@@ -46,6 +46,7 @@ Este documento descreve a transposição do simulador para uma arquitetura de pr
 ### B. Tratamento de Caos e Falhas
 - **Waiting Room (Buffer):** Eventos fora de ordem ficam em `pending_events` (Postgres). Um sweeper envia para a **DLQ (Dead Letter Queue)** os que esperam mais de **1h** pelo antecessor, e só os remove depois do ack da DLQ.
 - **DLQ:** Recebe só o que nunca vai funcionar (JSON malformado, envelope inválido, dado rejeitado pelo banco, plano divergente, buffer expirado). O envio espera o ack do broker, e só então o offset de origem é commitado. O producer cria o tópico `orders-dlq` sob demanda, o que exige `auto.create.topics.enable=true` no broker (ligado no compose); sem o tópico, a partição de origem fica parada em retry em vez de perder o evento.
+- **Entrega de webhooks (outbox):** *at-least-once* com `Idempotency-Key`. Só a notificação pendente mais antiga de cada pedido pode ser entregue, então a ordem por pedido é mantida sem que um pedido com falha atrase os outros. O retry é agendado no banco (`next_attempt_at`, backoff exponencial), 4xx vai para dead-letter na hora e o lease com `FOR UPDATE SKIP LOCKED` evita entregas simultâneas entre instâncias (ADR-005).
 - **Tombstones:** `ABORT_PLAN` marca o pedido como `aborted` e descarta o buffer do plano na mesma transação. Se chega antes de qualquer evento, grava um tombstone para descartar os eventos que chegarem depois. Pedido `completed` é terminal e ignora o abort.
 - **Observabilidade:** Cada salto (Hop) do evento propaga o header `traceparent`, permitindo visualização completa no Jaeger/Grafana.
 
@@ -140,5 +141,22 @@ O acompanhamento detalhado fica em [`docs/tasks.md`](tasks.md).
   - Redis Cluster e hash tags deixam de ser requisito de corretude; a escala de escrita passa a depender do Postgres.
 - **Consequencias:** Perder o Redis, ou ele ficar fora do ar, nao afeta a corretude nem para o processamento, e o `/health` passa a depender so do Postgres. A corretude e coberta por testes de integracao contra Postgres real (schema isolado criado a partir do `init.sql`), incluindo entregas concorrentes do mesmo evento.
 
+
+### ADR-005: Entrega de webhooks at-least-once, em ordem por pedido
+
+- **Data:** 2026-09-24
+- **Status:** Aceito.
+- **Contexto:** O dispatcher do outbox buscava 50 entradas e, para cada uma, retentava no lugar com `sleep` (5s, 10s). Uma entrada que falhava era pulada, e as seguintes do mesmo pedido eram entregues antes dela: o cenário de chaos registrou um pedido recebido como `[2, 3, 4, 5, 1]`. Além disso, 4xx era retentado, não havia `Idempotency-Key`, duas instâncias entregavam a mesma entrada (sem `SKIP LOCKED`) e a entrega nunca era exercitada, porque o compose não tinha receptor.
+- **Decisao:**
+  - Entrega *at-least-once* com `Idempotency-Key` = ID da entrada do outbox. Exactly-once não é possível através de HTTP: o dispatcher pode morrer entre a resposta e o registro. A deduplicação fica com o receptor.
+  - Só a entrada pendente mais antiga de cada pedido (a "cabeça") é elegível. Isso garante a ordem por pedido; pedidos diferentes são entregues em paralelo.
+  - Reivindicação com `FOR UPDATE SKIP LOCKED` e lease (`lease_until`, 1 min). Um lease abandonado por uma instância que morreu expira e a entrada volta a ser elegível.
+  - Retry agendado no banco (`attempts`, `next_attempt_at`, backoff exponencial de 1s até 1 min), sem `sleep` no dispatcher. 5xx, 408, 429 e erro de rede são retentáveis; após `WEBHOOK_MAX_ATTEMPTS` (10) a entrada vai para dead-letter (`dead_at`).
+  - Qualquer outro 4xx vai para dead-letter na primeira tentativa: o receptor recusou a notificação e tentar de novo não muda isso.
+  - Com o circuit breaker aberto nada é reivindicado; entradas não tentadas (circuito semiaberto, shutdown) são devolvidas sem contar tentativa.
+- **Trade-offs:**
+  - **Dead-letter não bloqueia o pedido:** depois que uma notificação vai para dead-letter, as seguintes do mesmo pedido são entregues. Bloquear o pedido para sempre por causa de uma notificação recusada seria pior para o receptor do que um buraco explícito, registrado no outbox (`dead_at`, `last_error`) e reprocessável. É a única situação em que a ordem por pedido não é garantida.
+  - A entrega de um pedido é sequencial: com N notificações, são N idas ao banco e N requisições em série. O dispatcher volta a consultar o outbox logo após uma entrega, sem esperar o intervalo de poll, para que isso não custe N intervalos.
+- **Consequencias:** O compose ganha o `webhook-sink` (receptor de teste com falhas injetáveis), e o chaos test ganha o cenário "Webhook Delivery". Esse cenário falha na versão anterior do dispatcher (entregas sem `Idempotency-Key`, 4xx retentado, ordem `[2, 3, 4, 5, 1]`) e passa nesta. Os testes de integração do dispatcher rodam contra Postgres real e cobrem ordem, isolamento entre pedidos, dead-letter, lease expirado, circuito aberto, shutdown e duas instâncias concorrentes.
 ---
 *Nexus Event Gateway: Confiabilidade absoluta em um mundo caótico.*

@@ -1,4 +1,4 @@
-.PHONY: help up down down-clean restart status logs validate wait agent-build agent-run agent-dry-run agent-abort-test chaos-test chaos-test-gaps chaos-test-redis chaos-test-zombie chaos-test-poison grafana-open jaeger-open
+.PHONY: help up down down-clean restart status logs validate wait agent-build agent-run agent-dry-run agent-abort-test chaos-test chaos-test-gaps chaos-test-redis chaos-test-zombie chaos-test-poison chaos-test-webhook webhook-stats grafana-open jaeger-open
 
 help: ## Exibe esta ajuda
 	@grep -E '^[a-zA-Z_%-]+:.*?## .*$$' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-15s\033[0m %s\n", $$1, $$2}'
@@ -154,3 +154,9 @@ chaos-test-zombie: ## Roda apenas cenário de Zombie Events
 
 chaos-test-poison: ## Roda apenas cenário de mensagens envenenadas (DLQ sem travar a partição)
 	@$(CHAOS_PYTHON) scripts/chaos_test.py --scenario poison --orders 10
+
+chaos-test-webhook: ## Roda apenas cenário de entrega de webhooks com receptor instável
+	@$(CHAOS_PYTHON) scripts/chaos_test.py --scenario webhook --orders 10
+
+webhook-stats: ## Mostra as entregas recebidas pelo webhook sink, por pedido
+	@curl -s http://localhost:9090/stats | python3 -m json.tool

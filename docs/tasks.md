@@ -68,3 +68,10 @@ Decisoes tecnologicas baseadas nos ADRs registrados em `docs/blueprint-arquitetu
 - [x] **Task 8.2:** `.gitignore` passa a versionar `.github/workflows/` (o resto de `.github/` segue ignorado por guardar arquivos locais de ferramentas de agente).
 - [x] **Task 8.3:** `make up` e `make wait` reconstroem imagens alteradas (`--build`); antes, subiam a imagem antiga do server depois de um `git pull`.
 - [x] **Task 8.4:** Higiene exigida pelo CI: `gofmt` no dispatcher e remocao de artefatos versionados (`agent/nexus_agent.egg-info/`, `package-lock.json` vazio).
+
+## 🟤 Fase 9: Entrega de Webhooks (ADR-005)
+
+- [x] **Task 9.1:** Receptor de webhooks para testes (`scripts/webhook_sink.py`, servico `webhook-sink` no compose): registra entregas, verifica ordem por `seq_id`, duplicatas e `Idempotency-Key`, e injeta 503/400.
+- [x] **Task 9.2:** Cenario de chaos "Webhook Delivery" (503 a cada 3 requisicoes e um pedido rejeitado com 400). Falha na versao anterior do dispatcher: sem `Idempotency-Key`, 4xx retentado e ordem `[2, 3, 4, 5, 1]`.
+- [x] **Task 9.3:** Dispatcher reescrito: so a cabeca de cada pedido e elegivel (ordem por pedido), `FOR UPDATE SKIP LOCKED` + lease, retry agendado no banco com backoff, 4xx em dead-letter imediato, `Idempotency-Key`, entrega paralela entre pedidos (`WEBHOOK_WORKERS`, antes ignorado).
+- [x] **Task 9.4:** Testes de integracao do dispatcher contra Postgres real: ordem, isolamento entre pedidos, dead-letter por 4xx e por tentativas, lease expirado, circuito aberto, shutdown e duas instancias concorrentes.
