@@ -24,6 +24,13 @@ CREATE TABLE outbox (
     payload JSONB NOT NULL,
     topic VARCHAR(100) NOT NULL,
     processed BOOLEAN DEFAULT FALSE,
+    -- Entrega pelo dispatcher: retry agendado no banco, lease para que duas
+    -- instâncias não entreguem a mesma entrada ao mesmo tempo, dead-letter.
+    attempts INTEGER NOT NULL DEFAULT 0,
+    next_attempt_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    lease_until TIMESTAMP WITH TIME ZONE,
+    last_error TEXT,
+    dead_at TIMESTAMP WITH TIME ZONE,
     created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
 );
 
@@ -45,6 +52,9 @@ CREATE INDEX idx_pending_events_received_at ON pending_events(received_at);
 -- Índice para performance na leitura do buffer de idempotência
 CREATE INDEX idx_orders_last_seq ON orders(id, last_seq_processed);
 
--- Índice parcial para o Outbox Poller buscar eventos não processados
+-- Índices parciais para o dispatcher: entradas pendentes em ordem e a entrada
+-- mais antiga pendente de cada pedido (só ela pode ser entregue).
 CREATE INDEX idx_outbox_unprocessed ON outbox(position)
-    WHERE processed = FALSE;
+    WHERE processed = FALSE AND dead_at IS NULL;
+CREATE INDEX idx_outbox_pending_by_aggregate ON outbox(aggregate_id, position)
+    WHERE processed = FALSE AND dead_at IS NULL;

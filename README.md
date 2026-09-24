@@ -12,6 +12,7 @@ graph LR
     B -.->|cache| C[(Redis<br/>Lua Script)]
     B --> D[(Postgres<br/>Source of Truth)]
     B --> E[DLQ<br/>Dead Letter Queue]
+    B -->|Webhooks do outbox| W[Webhook Sink<br/>receptor de teste]
     F[Consul] -.->|Service Discovery<br/>Circuit Breaker| B
     G[Jaeger] -.->|Traces OTLP| A & B
     H[Grafana] -.->|Dashboards| G
@@ -70,6 +71,7 @@ sequenceDiagram
 | **Kafka** | Apache Kafka 3.7 | Transporte com manual commit |
 | **Jaeger** | OTLP gRPC | Distributed tracing |
 | **Grafana** | Dashboards | Metricas e visualizacao de traces |
+| **Webhook Sink** | Python (stdlib) | Receptor de webhooks para testes: registra entregas, verifica ordem, duplicatas e `Idempotency-Key`, e injeta falhas |
 
 ## Garantias de Processamento
 
@@ -91,6 +93,21 @@ O objetivo e *effectively-once*: cada evento altera o pedido e gera notificacao 
 | JSON malformado ou envelope invalido | DLQ (`PARSE_ERROR` / `INVALID_EVENT`), a particao segue |
 | Redis fora do ar ou sem dados | processamento segue pelo Postgres |
 | Postgres fora do ar | retry no lugar; nada e commitado nem perdido |
+| Receptor de webhook com erro (5xx, 408, 429, timeout) | retry agendado no banco com backoff exponencial; a notificacao seguinte do mesmo pedido espera, os outros pedidos seguem |
+| Receptor rejeita a notificacao (outro 4xx) | dead-letter na hora, sem retry; as notificacoes seguintes do pedido continuam |
+| Webhook falha 10 vezes seguidas | dead-letter (`outbox.dead_at`) |
+| Dispatcher morre durante a entrega | o lease expira e outra instancia reenvia; o receptor deduplica pela `Idempotency-Key` |
+
+### Entrega de notificacoes (outbox → webhook)
+
+A entrega e *at-least-once*: se o dispatcher morrer entre a resposta HTTP e o registro no banco, a notificacao e reenviada. Por isso toda requisicao leva a `Idempotency-Key` (o ID da entrada do outbox) para o receptor deduplicar. Tambem sao enviados os headers `X-Aggregate-ID`, `X-Event-Type`, `X-Outbox-Position` e `X-Delivery-Attempt`.
+
+- **Ordem por pedido:** so a notificacao pendente mais antiga de cada pedido pode ser entregue. A seguinte espera a anterior ser entregue ou ir para dead-letter.
+- **Sem bloqueio entre pedidos:** um pedido com falha nao atrasa os outros; ate `WEBHOOK_WORKERS` pedidos sao entregues em paralelo.
+- **Varias instancias:** `FOR UPDATE SKIP LOCKED` mais um lease de 1 minuto garantem que duas instancias nao entreguem a mesma notificacao ao mesmo tempo.
+- **Circuit breaker aberto:** nada e reivindicado nem contado como tentativa.
+
+Detalhes e trade-offs no ADR-005 (`docs/blueprint-arquitetura.md`).
 
 ## Quick Start
 
@@ -122,7 +139,7 @@ O workflow `.github/workflows/ci.yml` roda em todo push, em qualquer branch:
 |---|---|
 | **Server (Go)** | `gofmt`, `go mod tidy` sem diff, `go vet` e `go test -race` com um Postgres 16 real; com `REQUIRE_INTEGRATION=1`, um teste de integracao sem banco falha em vez de ser pulado |
 | **Agent (Python)** | `pytest` do Agent Planner |
-| **E2E + Chaos** | sobe a stack com `docker compose`, roda o e2e (50 planos) e os 4 cenarios de chaos; so roda se os dois jobs acima passarem |
+| **E2E + Chaos** | sobe a stack com `docker compose`, roda o e2e (50 planos) e os 5 cenarios de chaos; so roda se os dois jobs acima passarem |
 
 Um PR so deve ser aberto com o CI verde no ultimo commit.
 
@@ -147,7 +164,8 @@ make demo-e2e
 # Demo E2E com 100 planos
 make demo-e2e PLANS=100
 
-# Chaos tests: sequence gaps, Redis restart (sem reenvio), zombie events e mensagens envenenadas (DLQ)
+# Chaos tests: sequence gaps, Redis restart (sem reenvio), zombie events, mensagens envenenadas (DLQ)
+# e entrega de webhooks com receptor instavel
 # Requer `make chaos-deps` e acesso ao Docker (o cenario Redis derruba o container nexus-redis)
 make chaos-test
 ```
@@ -257,6 +275,7 @@ make help  # Lista todos os comandos disponiveis
 | `make agent-test` | Testes unitarios Python |
 | `make demo-e2e` | Demo E2E Exactly-Once |
 | `make chaos-test` | Chaos tests completos |
+| `make webhook-stats` | Entregas recebidas pelo webhook sink, por pedido |
 
 ## Fases do Projeto
 
@@ -270,3 +289,4 @@ make help  # Lista todos os comandos disponiveis
 | 6 | Qualidade + Demo E2E | Completa |
 | 7 | Correcao das garantias (ADR-004) | Completa |
 | 8 | Integracao continua (GitHub Actions) | Completa |
+| 9 | Entrega de webhooks (ADR-005) | Completa |

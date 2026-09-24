@@ -30,8 +30,8 @@ type Config struct {
 
 	WebhookURL         string
 	WebhookWorkers     int
-	WebhookRetryMax    int
-	WebhookRetryDelay  time.Duration
+	WebhookMaxAttempts int
+	WebhookRetryBase   time.Duration
 	OutboxPollInterval time.Duration
 
 	// PendingEventTTL is how long an out-of-order event waits for its
@@ -65,9 +65,9 @@ func Load() (*Config, error) {
 		OTELServiceName: envOrDefault("OTEL_SERVICE_NAME", "nexus-server"),
 
 		WebhookURL:         envOrDefault("WEBHOOK_URL", "http://localhost:9090/webhook"),
-		WebhookWorkers:     envOrDefaultInt("WEBHOOK_WORKERS", 2),
-		WebhookRetryMax:    envOrDefaultInt("WEBHOOK_RETRY_MAX", 3),
-		WebhookRetryDelay:  5 * time.Second,
+		WebhookWorkers:     envOrDefaultInt("WEBHOOK_WORKERS", 4),
+		WebhookMaxAttempts: envOrDefaultInt("WEBHOOK_MAX_ATTEMPTS", 10),
+		WebhookRetryBase:   1 * time.Second,
 		OutboxPollInterval: 2 * time.Second,
 
 		PendingEventTTL: 1 * time.Hour,

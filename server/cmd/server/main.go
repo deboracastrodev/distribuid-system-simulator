@@ -82,7 +82,13 @@ func main() {
 	kvWatcher.SeedDefaults()
 
 	// --- Outbox Dispatcher (with Circuit Breaker) ---
-	disp := dispatcher.New(repo, cfg.WebhookURL, cfg.OutboxPollInterval, cfg.WebhookRetryMax, cfg.WebhookRetryDelay, kvWatcher)
+	disp := dispatcher.New(repo, dispatcher.Config{
+		WebhookURL:   cfg.WebhookURL,
+		PollInterval: cfg.OutboxPollInterval,
+		Workers:      cfg.WebhookWorkers,
+		MaxAttempts:  cfg.WebhookMaxAttempts,
+		RetryBase:    cfg.WebhookRetryBase,
+	}, kvWatcher)
 	// --- Consul Registration ---
 	consulClient, serviceID, err := registerConsul(cfg)
 	if err != nil {
