@@ -25,6 +25,7 @@ import logging
 import os
 import sys
 import time
+import urllib.parse
 import urllib.request
 import uuid
 from dataclasses import dataclass, field
@@ -52,6 +53,7 @@ POSTGRES_DSN = os.getenv(
 WEBHOOK_SINK_URL = os.getenv("WEBHOOK_SINK_URL", "http://localhost:9090")
 DOCKER_SERVER_CONTAINER = os.getenv("SERVER_CONTAINER", "nexus-server")
 SERVER_METRICS_URL = os.getenv("SERVER_METRICS_URL", "http://localhost:8080/metrics")
+PROMETHEUS_URL = os.getenv("PROMETHEUS_URL", "http://localhost:9095")
 
 # Sequência completa de event types para um pedido happy-path
 EVENT_SEQUENCE = [
@@ -313,6 +315,29 @@ def _server_duplicates() -> float:
     return 0.0
 
 
+def _wait_for_scrape(timeout: int = 30) -> None:
+    """Espera o Prometheus raspar o server depois deste instante.
+
+    Os contadores vivem na memória do server: o que foi incrementado depois do
+    último scrape se perde num crash (é assim em produção também). Sem esta
+    espera, o que os cenários anteriores produziram nos últimos segundos some,
+    e o check_metrics falharia por timing. Sem Prometheus no ar, segue direto.
+    """
+    start = time.time()
+    query = urllib.parse.urlencode({"query": 'timestamp(up{job="nexus-server"})'})
+    while time.time() - start < timeout:
+        try:
+            with urllib.request.urlopen(f"{PROMETHEUS_URL}/api/v1/query?{query}", timeout=5) as resp:
+                result = json.loads(resp.read())["data"]["result"]
+        except OSError:
+            logger.info("Prometheus inacessível: o crash pode apagar contadores ainda não raspados")
+            return
+        if result and float(result[0]["value"][1]) > start:
+            return
+        time.sleep(1)
+    logger.warning("Prometheus não raspou o server em %ds", timeout)
+
+
 def _wait_blocked(conn, plans: list[Plan], timeout: int = 30) -> bool:
     """Espera os planos terem seq 2 aplicado e o server parado esperando o lock."""
     deadline = time.time() + timeout
@@ -354,6 +379,7 @@ def scenario_server_crash(producer: Producer, conn, num_orders: int) -> Scenario
     except Exception as e:
         return ScenarioResult(name, False, f"Container do server indisponível: {e}")
 
+    _wait_for_scrape()
     lock_conn = psycopg2.connect(POSTGRES_DSN)
     try:
         with lock_conn.cursor() as cur:

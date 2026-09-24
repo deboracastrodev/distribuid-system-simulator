@@ -228,6 +228,7 @@ O acompanhamento detalhado fica em [`docs/tasks.md`](tasks.md).
 - **Trade-offs:**
   - Duplicatas e eventos de plano abortado passam a custar uma transação no Postgres, em vez de um `GET` no Redis. O custo real será medido na Fase 17; para o volume deste projeto, a transação já acontecia para todo evento novo.
   - Mudar o circuit breaker exige reiniciar o server (não há mais recarga a quente).
+  - O cenário de crash expõe um limite de qualquer métrica por pull: o que os contadores registraram depois do último scrape se perde quando o processo morre. O cenário espera um scrape antes do SIGKILL para que o `check_metrics` seja determinístico; em produção, um crash custa até um intervalo de scrape (5s) de contagem.
 - **Consequências:** Duas dependências a menos no `go.mod` (cliente Consul e go-redis, mais o miniredis dos testes), dois containers a menos no compose e o `/health` depende só do Postgres. O novo cenário de chaos cobre uma falha que antes só os testes de integração cobriam: o crash do próprio gateway.
 
 ---
