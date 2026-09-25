@@ -407,7 +407,7 @@
       "id": 9,
       "type": "timeseries",
       "title": "Eventos por desfecho",
-      "description": "Decisao de sequenciamento por evento resolvido. cache_* = pulado pelo cache do Redis.",
+      "description": "Decisao de sequenciamento por evento resolvido.",
       "datasource": {
         "type": "prometheus",
         "uid": "prometheus"
@@ -630,7 +630,7 @@
     {
       "id": 13,
       "type": "timeseries",
-      "title": "Retries e falhas do cache",
+      "title": "Retries e eventos drenados",
       "description": "",
       "datasource": {
         "type": "prometheus",
@@ -658,19 +658,9 @@
             "type": "prometheus",
             "uid": "prometheus"
           },
-          "expr": "sum by (op) (rate(nexus_seq_cache_errors_total[1m]))",
-          "legendFormat": "cache {{op}}",
-          "refId": "B",
-          "range": true
-        },
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "prometheus"
-          },
           "expr": "rate(nexus_events_drained_total[1m])",
           "legendFormat": "drenados do buffer",
-          "refId": "C",
+          "refId": "B",
           "range": true
         }
       ],

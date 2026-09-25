@@ -1,12 +1,9 @@
 networks:
   nexus:
     driver: bridge
-    ipam:
-      config:
-        - subnet: 172.28.0.0/16
 
 services:
-  # --- MENSAGERIA (Exactly-Once Transport) ---
+  # --- MENSAGERIA ---
   kafka:
     image: apache/kafka:3.7.0
     container_name: nexus-kafka
@@ -36,21 +33,6 @@ services:
     networks:
       - nexus
 
-  # --- ESTADO ATÔMICO (Idempotency Engine) ---
-  redis:
-    image: redis:7.2-alpine
-    container_name: nexus-redis
-    command: redis-server --requirepass nexus_pass
-    ports:
-      - "6379:6379"
-    healthcheck:
-      test: ["CMD-SHELL", "REDISCLI_AUTH=nexus_pass redis-cli ping"]
-      interval: 5s
-      timeout: 3s
-      retries: 5
-    networks:
-      - nexus
-
   # --- SOURCE OF TRUTH (ACID Storage) ---
   postgres:
     image: postgres:16
@@ -71,53 +53,23 @@ services:
     networks:
       - nexus
 
-  # --- COORDENAÇÃO (Service Discovery & Health Checks) ---
-  consul:
-    image: hashicorp/consul:1.22
-    container_name: nexus-consul
-    command: consul agent -dev -client=0.0.0.0 -dns-port=53 -recursor=127.0.0.11 -config-file=/consul/config/services.json
-    ports:
-      - "8500:8500"
-      - "8600:8600/udp"
-    volumes:
-      - ./consul-services.json:/consul/config/services.json
-    healthcheck:
-      test: ["CMD", "consul", "members"]
-      interval: 5s
-      timeout: 3s
-      retries: 5
-    networks:
-      nexus:
-        ipv4_address: 172.28.0.100
-
-  # --- SERVER GO (Event Processor / Exactly-Once Engine) ---
+  # --- SERVER GO (sequenciamento, outbox e entrega de webhooks) ---
   server:
     build: ./server
     container_name: nexus-server
     depends_on:
       kafka:
         condition: service_healthy
-      redis:
-        condition: service_healthy
       postgres:
-        condition: service_healthy
-      consul:
         condition: service_healthy
       webhook-sink:
         condition: service_healthy
-    dns:
-      - 172.28.0.100
-    dns_search:
-      - service.consul
     environment:
-      KAFKA_BOOTSTRAP_SERVERS: kafka.service.consul:29092
+      KAFKA_BOOTSTRAP_SERVERS: kafka:29092
       KAFKA_TOPIC: orders
       KAFKA_DLQ_TOPIC: orders-dlq
       KAFKA_CONSUMER_GROUP: nexus-server-group
-      REDIS_ADDR: redis.service.consul:6379
-      REDIS_PASSWORD: nexus_pass
-      POSTGRES_DSN: postgres://nexus_user:nexus_pass@postgres.service.consul:5432/nexus_db?sslmode=disable
-      CONSUL_ADDR: 172.28.0.100:8500
+      POSTGRES_DSN: postgres://nexus_user:nexus_pass@postgres:5432/nexus_db?sslmode=disable
       OTEL_EXPORTER_OTLP_ENDPOINT: jaeger:4317
       OTEL_SERVICE_NAME: nexus-server
       WEBHOOK_URL: http://webhook-sink:9090/webhook
@@ -155,12 +107,8 @@ services:
     depends_on:
       kafka:
         condition: service_healthy
-    dns:
-      - 172.28.0.100
-    dns_search:
-      - service.consul
     environment:
-      KAFKA_BOOTSTRAP_SERVERS: kafka.service.consul:29092
+      KAFKA_BOOTSTRAP_SERVERS: kafka:29092
       KAFKA_TOPIC: orders
       OTEL_EXPORTER_OTLP_ENDPOINT: http://jaeger:4317
       OTEL_SERVICE_NAME: nexus-agent

@@ -13,7 +13,6 @@ FROM alpine:3.20
 RUN apk add --no-cache ca-certificates wget
 
 COPY --from=builder /nexus-server /usr/local/bin/nexus-server
-COPY scripts/lua/ /app/scripts/lua/
 
 EXPOSE 8080
 

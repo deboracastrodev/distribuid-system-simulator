@@ -6,8 +6,11 @@ encontrar os efeitos deles: eventos aplicados, mensagens na DLQ, webhooks
 entregues, retentados e rejeitados.
 
 Verifica:
-1. /metrics do server tem as séries esperadas, com valores coerentes;
-2. o Prometheus está fazendo scrape do server (up == 1) e já tem os dados;
+1. /metrics do server expõe todas as séries esperadas;
+2. o Prometheus está fazendo scrape do server (up == 1) e os contadores
+   cresceram de forma coerente com o que rodou. O valor vem do Prometheus
+   (increase), e não do /metrics: o cenário de crash reinicia o server e zera
+   os contadores em memória, e o increase() trata esse reinício;
 3. toda query do dashboard executa sem erro e retorna pelo menos uma série;
 4. o Grafana provisionou o dashboard e o datasource Prometheus responde.
 
@@ -36,14 +39,13 @@ GRAFANA_URL = os.getenv("GRAFANA_URL", "http://localhost:3000")
 GRAFANA_AUTH = os.getenv("GRAFANA_AUTH", "admin:nexus")
 DASHBOARD = Path(__file__).resolve().parent.parent / "monitoring/grafana/dashboards/nexus-metrics.json"
 
-# (série, rótulos) que o e2e + chaos test garantem ser > 0.
+# (série, rótulos) que o e2e, o agent e o chaos test garantem ter crescido.
 EXPECTED_POSITIVE = [
     ("nexus_events_processed_total", {"kind": "sequenced", "outcome": "apply"}),
     ("nexus_events_processed_total", {"kind": "abort", "outcome": "apply"}),
     ("nexus_events_drained_total", {}),
     ("nexus_dlq_messages_total", {"code": "PARSE_ERROR"}),
     ("nexus_dlq_messages_total", {"code": "INVALID_EVENT"}),
-    ("nexus_seq_cache_errors_total", {"op": "lookup"}),
     ("nexus_webhook_deliveries_total", {"result": "delivered"}),
     ("nexus_webhook_deliveries_total", {"result": "retry_scheduled"}),
     ("nexus_webhook_deliveries_total", {"result": "dead_rejected"}),
@@ -100,26 +102,40 @@ def check_server() -> list[str]:
     samples = parse_exposition(get(SERVER_METRICS_URL).decode())
     problems = []
     for name, labels in EXPECTED_POSITIVE:
-        v = value(samples, name, labels)
-        if v is None:
+        if value(samples, name, labels) is None:
             problems.append(f"série ausente: {name}{labels}")
-        elif v <= 0:
-            problems.append(f"{name}{labels} = {v}, esperado > 0")
     for name in EXPECTED_PRESENT:
         if not any(n == name for n, _, _ in samples):
             problems.append(f"série ausente: {name}")
     return problems
 
 
+def selector(name: str, labels: dict) -> str:
+    return name + "{" + ",".join(f'{k}="{v}"' for k, v in labels.items()) + "}"
+
+
+def not_increased() -> list[str]:
+    problems = []
+    for name, labels in EXPECTED_POSITIVE:
+        result = prom_query(f"sum(increase({selector(name, labels)}[1h]))")
+        total = float(result[0]["value"][1]) if result else 0.0
+        if total <= 0:
+            problems.append(f"{name}{labels} não cresceu na última hora (increase = {total})")
+    return problems
+
+
 def check_prometheus(timeout: int = 60) -> list[str]:
     deadline = time.time() + timeout
+    problems = ["Prometheus não fez scrape do server (up != 1)"]
     while time.time() < deadline:
         up = prom_query('up{job="nexus-server"}')
-        delivered = prom_query('nexus_webhook_deliveries_total{result="delivered"} > 0')
-        if up and float(up[0]["value"][1]) == 1 and delivered:
-            return []
+        if up and float(up[0]["value"][1]) == 1:
+            # O último incremento pode ainda não ter sido raspado: espera o próximo scrape.
+            problems = not_increased()
+            if not problems:
+                return []
         time.sleep(2)
-    return ["Prometheus não fez scrape do server (up != 1) ou ainda não tem os dados"]
+    return problems
 
 
 def check_dashboard_queries() -> list[str]:
@@ -160,7 +176,7 @@ def main() -> None:
 
     checks = [
         ("server /metrics", check_server),
-        ("scrape do Prometheus", check_prometheus),
+        ("scrape e contadores no Prometheus", check_prometheus),
         ("queries do dashboard", check_dashboard_queries),
     ]
     if not args.skip_grafana:

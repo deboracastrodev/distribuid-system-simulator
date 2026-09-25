@@ -22,7 +22,6 @@ import (
 
 	"github.com/sony/gobreaker/v2"
 
-	consulkv "github.com/user/nexus-server/internal/consul"
 	"github.com/user/nexus-server/internal/db"
 	"github.com/user/nexus-server/internal/metrics"
 )
@@ -37,10 +36,17 @@ type OutboxStore interface {
 	ReleaseOutbox(ctx context.Context, id string) error
 }
 
-// CBConfigSource provides circuit breaker settings; *consul.KVWatcher
-// implements it and reloads them from Consul KV.
-type CBConfigSource interface {
-	Config() consulkv.CBConfig
+// Breaker configures the circuit breaker in front of the webhook receiver.
+type Breaker struct {
+	// FailureThreshold is how many consecutive failures open the circuit.
+	FailureThreshold uint32
+	// SuccessThreshold is how many requests are let through while half-open;
+	// all of them must succeed to close the circuit.
+	SuccessThreshold uint32
+	// OpenDuration is how long the circuit stays open before probing again.
+	OpenDuration time.Duration
+	// RequestTimeout bounds each webhook request.
+	RequestTimeout time.Duration
 }
 
 type Config struct {
@@ -56,7 +62,8 @@ type Config struct {
 	RetryMax    time.Duration
 	// Lease is how long a claimed entry stays reserved; it must outlast one
 	// HTTP request.
-	Lease time.Duration
+	Lease   time.Duration
+	Breaker Breaker
 }
 
 func (c Config) withDefaults() Config {
@@ -81,60 +88,48 @@ func (c Config) withDefaults() Config {
 	if c.Lease <= 0 {
 		c.Lease = time.Minute
 	}
+	if c.Breaker.FailureThreshold == 0 {
+		c.Breaker.FailureThreshold = 5
+	}
+	if c.Breaker.SuccessThreshold == 0 {
+		c.Breaker.SuccessThreshold = 2
+	}
+	if c.Breaker.OpenDuration <= 0 {
+		c.Breaker.OpenDuration = 30 * time.Second
+	}
+	if c.Breaker.RequestTimeout <= 0 {
+		c.Breaker.RequestTimeout = 10 * time.Second
+	}
 	return c
 }
 
 type Dispatcher struct {
 	store      OutboxStore
 	cfg        Config
-	cbSource   CBConfigSource
+	cb         *gobreaker.CircuitBreaker[int]
 	httpClient *http.Client
 	metrics    *metrics.Metrics
-
-	mu           sync.RWMutex
-	cb           *gobreaker.CircuitBreaker[int]
-	lastCBConfig consulkv.CBConfig
 }
 
-func New(store OutboxStore, cfg Config, cbSource CBConfigSource, m *metrics.Metrics) *Dispatcher {
+func New(store OutboxStore, cfg Config, m *metrics.Metrics) *Dispatcher {
 	d := &Dispatcher{
 		store:      store,
 		cfg:        cfg.withDefaults(),
-		cbSource:   cbSource,
 		httpClient: &http.Client{},
 		metrics:    m,
 	}
-	d.refreshCircuitBreaker()
+	d.cb = d.newCircuitBreaker()
 	return d
 }
 
-// refreshCircuitBreaker recreates the CB if immutable settings changed.
-func (d *Dispatcher) refreshCircuitBreaker() {
-	newCfg := d.cbSource.Config()
-
-	d.mu.Lock()
-	defer d.mu.Unlock()
-
-	// Only recreate if immutable settings (MaxRequests/Timeout) changed
-	if d.cb != nil &&
-		d.lastCBConfig.SuccessThreshold == newCfg.SuccessThreshold &&
-		d.lastCBConfig.OpenDuration == newCfg.OpenDuration {
-		return
-	}
-
-	slog.Info("initializing/refreshing circuit breaker",
-		"success_threshold", newCfg.SuccessThreshold,
-		"open_duration", newCfg.OpenDuration,
-	)
-
-	settings := gobreaker.Settings{
+func (d *Dispatcher) newCircuitBreaker() *gobreaker.CircuitBreaker[int] {
+	b := d.cfg.Breaker
+	cb := gobreaker.NewCircuitBreaker[int](gobreaker.Settings{
 		Name:        "webhook-dispatcher",
-		MaxRequests: newCfg.SuccessThreshold,
-		Timeout:     newCfg.OpenDuration,
+		MaxRequests: b.SuccessThreshold,
+		Timeout:     b.OpenDuration,
 		ReadyToTrip: func(counts gobreaker.Counts) bool {
-			// FailureThreshold is truly dynamic as it's checked here
-			threshold := d.cbSource.Config().FailureThreshold
-			return counts.ConsecutiveFailures >= threshold
+			return counts.ConsecutiveFailures >= b.FailureThreshold
 		},
 		OnStateChange: func(name string, from, to gobreaker.State) {
 			slog.Warn("circuit breaker state changed",
@@ -145,17 +140,9 @@ func (d *Dispatcher) refreshCircuitBreaker() {
 			d.metrics.CircuitBreakerState.Set(cbStateValue(to))
 			d.metrics.CircuitBreakerTransitions.WithLabelValues(to.String()).Inc()
 		},
-	}
-
-	d.cb = gobreaker.NewCircuitBreaker[int](settings)
-	d.metrics.CircuitBreakerState.Set(cbStateValue(d.cb.State()))
-	d.lastCBConfig = newCfg
-}
-
-func (d *Dispatcher) getCB() *gobreaker.CircuitBreaker[int] {
-	d.mu.RLock()
-	defer d.mu.RUnlock()
-	return d.cb
+	})
+	d.metrics.CircuitBreakerState.Set(cbStateValue(cb.State()))
+	return cb
 }
 
 // Run delivers outbox entries until ctx is cancelled.
@@ -168,7 +155,6 @@ func (d *Dispatcher) Run(ctx context.Context) {
 	)
 
 	for {
-		d.refreshCircuitBreaker()
 		delivered, err := d.dispatchBatch(ctx)
 		if err != nil && ctx.Err() == nil {
 			slog.Error("outbox dispatch failed", "error", err)
@@ -196,7 +182,7 @@ func (d *Dispatcher) Run(ctx context.Context) {
 func (d *Dispatcher) dispatchBatch(ctx context.Context) (int, error) {
 	// While the circuit is open nothing would be sent: leave the entries
 	// unclaimed instead of claiming and releasing them.
-	if d.getCB().State() == gobreaker.StateOpen {
+	if d.cb.State() == gobreaker.StateOpen {
 		return 0, nil
 	}
 
@@ -231,7 +217,7 @@ func (d *Dispatcher) deliver(ctx context.Context, entry db.OutboxEntry) bool {
 	defer cancel()
 	log := slog.With("outbox_id", entry.ID, "aggregate_id", entry.AggregateID, "event_type", entry.EventType)
 
-	status, err := d.getCB().Execute(func() (int, error) {
+	status, err := d.cb.Execute(func() (int, error) {
 		status, err := d.post(ctx, entry)
 		if err != nil {
 			return 0, err
@@ -296,7 +282,7 @@ func (d *Dispatcher) post(ctx context.Context, entry db.OutboxEntry) (int, error
 	// The request must finish well within the lease, or another dispatcher
 	// could claim the entry while it is still in flight.
 	timeout := d.cfg.Lease / 2
-	if t := d.cbSource.Config().Timeout; t > 0 && t < timeout {
+	if t := d.cfg.Breaker.RequestTimeout; t < timeout {
 		timeout = t
 	}
 	reqCtx, cancel := context.WithTimeout(ctx, timeout)

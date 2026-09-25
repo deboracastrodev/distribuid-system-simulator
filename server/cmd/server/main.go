@@ -11,19 +11,16 @@ import (
 	"syscall"
 	"time"
 
-	consulapi "github.com/hashicorp/consul/api"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/collectors"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 
 	"github.com/user/nexus-server/internal/config"
-	consulkv "github.com/user/nexus-server/internal/consul"
 	"github.com/user/nexus-server/internal/consumer"
 	"github.com/user/nexus-server/internal/db"
 	"github.com/user/nexus-server/internal/dispatcher"
 	"github.com/user/nexus-server/internal/dlq"
 	"github.com/user/nexus-server/internal/metrics"
-	redisc "github.com/user/nexus-server/internal/redis"
 	"github.com/user/nexus-server/internal/telemetry"
 )
 
@@ -43,18 +40,6 @@ func main() {
 	shutdownTracer, err := telemetry.Init(ctx, cfg.OTELEndpoint, cfg.OTELServiceName)
 	if err != nil {
 		slog.Warn("OpenTelemetry init failed (non-fatal)", "error", err)
-	}
-
-	// --- Redis (seq cache: optional, Postgres decides when it is down) ---
-	redisClient, err := redisc.New(cfg.RedisAddr, cfg.RedisPassword, cfg.LuaScriptPath)
-	if err != nil {
-		slog.Error("redis init failed", "error", err)
-		os.Exit(1)
-	}
-	if err := redisClient.Ping(ctx); err != nil {
-		slog.Warn("redis unavailable at startup, running without seq cache until it recovers", "error", err)
-	} else {
-		slog.Info("connected to Redis")
 	}
 
 	// --- Postgres ---
@@ -84,18 +69,11 @@ func main() {
 	}
 
 	// --- Kafka Consumer ---
-	cons, err := consumer.New(cfg.KafkaBrokers, cfg.KafkaTopic, cfg.KafkaConsumerGroup, cfg.PendingEventTTL, repo, redisClient, dlqProducer, m)
+	cons, err := consumer.New(cfg.KafkaBrokers, cfg.KafkaTopic, cfg.KafkaConsumerGroup, cfg.PendingEventTTL, repo, dlqProducer, m)
 	if err != nil {
 		slog.Error("kafka consumer init failed", "error", err)
 		os.Exit(1)
 	}
-
-	// --- Consul KV Watcher (Circuit Breaker config) ---
-	kvWatcher, err := consulkv.NewKVWatcher(cfg.ConsulAddr)
-	if err != nil {
-		slog.Warn("Consul KV watcher init failed, using defaults", "error", err)
-	}
-	kvWatcher.SeedDefaults()
 
 	// --- Outbox Dispatcher (with Circuit Breaker) ---
 	disp := dispatcher.New(repo, dispatcher.Config{
@@ -104,24 +82,19 @@ func main() {
 		Workers:      cfg.WebhookWorkers,
 		MaxAttempts:  cfg.WebhookMaxAttempts,
 		RetryBase:    cfg.WebhookRetryBase,
-	}, kvWatcher, m)
-	// --- Consul Registration ---
-	consulClient, serviceID, err := registerConsul(cfg)
-	if err != nil {
-		slog.Warn("Consul registration failed (non-fatal)", "error", err)
-	}
+		Breaker: dispatcher.Breaker{
+			FailureThreshold: uint32(cfg.WebhookCBFailureThreshold),
+			SuccessThreshold: uint32(cfg.WebhookCBSuccessThreshold),
+			OpenDuration:     cfg.WebhookCBOpenDuration,
+			RequestTimeout:   cfg.WebhookTimeout,
+		},
+	}, m)
 
 	// --- HTTP server: /health and /metrics ---
 	mux := http.NewServeMux()
 	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
-		// Postgres is required to process events; the Redis cache is not.
 		if err := repo.Ping(r.Context()); err != nil {
 			http.Error(w, "postgres unhealthy", http.StatusServiceUnavailable)
-			return
-		}
-		w.WriteHeader(http.StatusOK)
-		if err := redisClient.Ping(r.Context()); err != nil {
-			fmt.Fprint(w, "OK (degraded: seq cache unavailable)")
 			return
 		}
 		fmt.Fprint(w, "OK")
@@ -153,30 +126,6 @@ func main() {
 		}
 	}()
 
-	// Consul TTL heartbeat
-	if consulClient != nil && serviceID != "" {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			ticker := time.NewTicker(cfg.HealthCheckTTL / 3)
-			defer ticker.Stop()
-			for {
-				select {
-				case <-ctx.Done():
-					return
-				case <-ticker.C:
-					consulClient.Agent().PassTTL("service:"+serviceID, "healthy")
-				}
-			}
-		}()
-	}
-
-	// Consul KV config watcher (hot-reload CB settings)
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		kvWatcher.Watch(ctx)
-	}()
 	slog.Info("nexus-server started", "topic", cfg.KafkaTopic, "group", cfg.KafkaConsumerGroup)
 
 	// --- Graceful Shutdown ---
@@ -198,43 +147,11 @@ func main() {
 
 	cons.Close()
 	dlqProducer.Close()
-	redisClient.Close()
 	repo.Close()
 
-	if consulClient != nil && serviceID != "" {
-		consulClient.Agent().ServiceDeregister(serviceID)
-		slog.Info("deregistered from Consul")
-	}
 	if shutdownTracer != nil {
 		shutdownTracer(shutdownCtx)
 	}
 
 	slog.Info("nexus-server stopped gracefully")
-}
-
-func registerConsul(cfg *config.Config) (*consulapi.Client, string, error) {
-	consulCfg := consulapi.DefaultConfig()
-	consulCfg.Address = cfg.ConsulAddr
-	client, err := consulapi.NewClient(consulCfg)
-	if err != nil {
-		return nil, "", fmt.Errorf("creating consul client: %w", err)
-	}
-
-	serviceID := fmt.Sprintf("%s-%d", cfg.ServiceName, os.Getpid())
-	registration := &consulapi.AgentServiceRegistration{
-		ID:   serviceID,
-		Name: cfg.ServiceName,
-		Port: cfg.ServicePort,
-		Check: &consulapi.AgentServiceCheck{
-			TTL:                            cfg.HealthCheckTTL.String(),
-			DeregisterCriticalServiceAfter: "1m",
-		},
-	}
-
-	if err := client.Agent().ServiceRegister(registration); err != nil {
-		return nil, "", fmt.Errorf("registering service: %w", err)
-	}
-
-	slog.Info("registered in Consul", "service_id", serviceID)
-	return client, serviceID, nil
 }
